@@ -1,0 +1,48 @@
+# ====================== SECRETS & KEYS (MOST IMPORTANT) ======================
+.env
+*.env
+*.pem
+kalshi-private*
+*.key
+*.pem.bak
+
+# ====================== PROJECT-SPECIFIC ======================
+logs/
+data/
+*.db
+*.log
+historical_*.json
+historical_model.pkl
+trades.db
+bot.log
+
+# ====================== PYTHON & VIRTUAL ENV ======================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# ====================== CACHE & BUILD ======================
+.vscode/
+.idea/
+*.swp
+*.swo
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ====================== OS & MISC ======================
+.DS_Store
+Thumbs.db
