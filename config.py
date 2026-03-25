@@ -41,6 +41,18 @@ def get_required_bool_env(name: str) -> bool:
 	raise ValueError(f"Invalid boolean value for {name}: {value}")
 
 
+def get_optional_bool_env(name: str, default: bool) -> bool:
+	value = os.getenv(name)
+	if value is None:
+		return default
+	value = value.strip().lower()
+	if value in TRUTHY_VALUES:
+		return True
+	if value in FALSY_VALUES:
+		return False
+	raise ValueError(f"Invalid boolean value for {name}: {value}")
+
+
 def get_required_int_env(name: str) -> int:
 	return int(get_required_env(name))
 
@@ -85,6 +97,8 @@ UNDERVALUED_MIN_PROBABILITY = get_required_float_env("UNDERVALUED_MIN_PROBABILIT
 MARKET_TITLE_CONTAINS = get_optional_env("MARKET_TITLE_CONTAINS")
 EXCLUDED_MARKET_TICKERS = [ticker.upper() for ticker in get_csv_env("EXCLUDED_MARKET_TICKERS")] if os.getenv("EXCLUDED_MARKET_TICKERS") else []
 DISCORD_WEBHOOK_URL = get_optional_env("DISCORD_WEBHOOK_URL")
+DISCORD_INCLUDE_ROLLING24H = get_optional_bool_env("DISCORD_INCLUDE_ROLLING24H", True)
+DISCORD_INCLUDE_ALL_TIME_PERFORMANCE = get_required_bool_env("DISCORD_INCLUDE_ALL_TIME_PERFORMANCE")
 USE_GROK = get_required_bool_env("USE_GROK")
 OVERRIDE_INTERNAL_MODEL_WITH_GROK = get_required_bool_env("OVERRIDE_INTERNAL_MODEL_WITH_GROK")
 OVERRIDE_GROK_IGNORE_VOLUME_GATE = get_required_bool_env("OVERRIDE_GROK_IGNORE_VOLUME_GATE")
@@ -126,6 +140,8 @@ print(f"[CONFIG] USE_UNDERVALUED_MARKETS: {USE_UNDERVALUED_MARKETS}")
 print(f"[CONFIG] UNDERVALUED_MIN_PROBABILITY: {UNDERVALUED_MIN_PROBABILITY}")
 print(f"[CONFIG] MARKET_TITLE_CONTAINS: {MARKET_TITLE_CONTAINS or 'NONE'}")
 print(f"[CONFIG] EXCLUDED_MARKET_TICKERS: {EXCLUDED_MARKET_TICKERS or 'NONE'}")
+print(f"[CONFIG] DISCORD_INCLUDE_ROLLING24H: {DISCORD_INCLUDE_ROLLING24H}")
+print(f"[CONFIG] DISCORD_INCLUDE_ALL_TIME_PERFORMANCE: {DISCORD_INCLUDE_ALL_TIME_PERFORMANCE}")
 print(f"[CONFIG] USE_GROK: {USE_GROK}")
 print(f"[CONFIG] OVERRIDE_INTERNAL_MODEL_WITH_GROK: {OVERRIDE_INTERNAL_MODEL_WITH_GROK}")
 print(f"[CONFIG] OVERRIDE_GROK_IGNORE_VOLUME_GATE: {OVERRIDE_GROK_IGNORE_VOLUME_GATE}")

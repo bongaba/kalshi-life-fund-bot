@@ -5,7 +5,7 @@ import requests
 import uuid
 import base64
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from loguru import logger
 from logging_setup import setup_log_file
 from cryptography.hazmat.primitives import serialization
@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from config import *
 from decision_engine import should_trade
-from discord_notifications import notify_trade_executed, notify_error, notify_startup, notify_cycle_summary, notify_account_balance
+from discord_notifications import notify_trade_executed, notify_error, notify_startup, notify_cycle_summary, notify_account_balance, notify_rolling_24h_performance, notify_all_time_performance
 import winsound
 
 setup_log_file("bot.log")
@@ -136,6 +136,7 @@ def ensure_trade_table_columns():
         'client_order_id': 'TEXT',
         'kalshi_order_id': 'TEXT',
         'order_status': 'TEXT',
+        'resolved_timestamp': 'TEXT',
     }
 
     for column_name, column_type in required_columns.items():
@@ -192,23 +193,144 @@ def update_trade_status(ticker, new_status, pnl=None):
     conn.commit()
     logger.info(f"Updated status for {ticker} to {new_status}")
 
+
+def resolve_winner_from_settlement_value(raw_value):
+    """Normalize Kalshi settlement values and return YES/NO winner or None if unresolved."""
+    if raw_value is None:
+        return None
+
+    # Handle strings such as "1", "0", "100", "yes", "no".
+    if isinstance(raw_value, str):
+        normalized = raw_value.strip().lower()
+        if normalized in {"yes", "y", "true", "won_yes"}:
+            return "YES"
+        if normalized in {"no", "n", "false", "won_no"}:
+            return "NO"
+        try:
+            raw_value = float(normalized)
+        except ValueError:
+            return None
+
+    # Kalshi payloads can be 0/1 or 0/100 style; treat >= 0.5 (or >= 50) as YES.
+    if isinstance(raw_value, (int, float)):
+        value = float(raw_value)
+        if value in (0.0, 1.0):
+            return "YES" if value == 1.0 else "NO"
+        if value in (0.0, 100.0):
+            return "YES" if value == 100.0 else "NO"
+        if value > 1.0:
+            return "YES" if value >= 50.0 else "NO"
+        return "YES" if value >= 0.5 else "NO"
+
+    return None
+
+
+def resolve_winner_from_market_payload(market):
+    """Resolve YES/NO winner from documented market fields with compatibility fallbacks."""
+    result = market.get('result')
+    if isinstance(result, str):
+        normalized = result.strip().lower()
+        if normalized in {'yes', 'y'}:
+            return 'YES'
+        if normalized in {'no', 'n'}:
+            return 'NO'
+
+    # Fallback for older/alternate payload conventions.
+    settlement_value = market.get('settlement_value')
+    if settlement_value is None:
+        settlement_value = market.get('settlement_value_dollars')
+    return resolve_winner_from_settlement_value(settlement_value)
+
+
+def resolve_winner_from_settlement_payload(settlement):
+    """Resolve YES/NO winner from documented portfolio settlement payload."""
+    market_result = settlement.get('market_result')
+    if isinstance(market_result, str):
+        normalized = market_result.strip().lower()
+        if normalized in {'yes', 'y'}:
+            return 'YES'
+        if normalized in {'no', 'n'}:
+            return 'NO'
+    return None
+
+
+def normalize_settled_timestamp(settled_time_raw):
+    """Convert API settled_time to SQLite-compatible UTC timestamp string."""
+    if not settled_time_raw:
+        return None
+
+    if isinstance(settled_time_raw, str):
+        raw = settled_time_raw.strip()
+        try:
+            if raw.endswith('Z'):
+                dt = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+            else:
+                dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt.strftime('%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            return None
+
+    return None
+
+
+def fetch_portfolio_settlements(days=30, max_pages=20):
+    min_ts = int(time.time()) - (days * 24 * 3600)
+    params = {
+        "limit": 200,
+        "min_ts": min_ts,
+    }
+
+    all_settlements = []
+    cursor = None
+    page = 1
+
+    while page <= max_pages:
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            data = signed_request("GET", "/portfolio/settlements", params=params)
+        except requests.exceptions.HTTPError as e:
+            if e.response and e.response.status_code == 429:
+                logger.warning("Rate limit hit on settlements endpoint — sleeping 60s")
+                time.sleep(60)
+                break
+            raise
+
+        settlements_page = data.get('settlements', [])
+        all_settlements.extend(settlements_page)
+        cursor = data.get('cursor')
+        logger.info(f"Page {page}: {len(settlements_page)} portfolio settlements")
+        page += 1
+        if not cursor:
+            break
+
+    return all_settlements
+
 def update_resolved_trades():
     global daily_loss
     try:
         logger.info("Checking for resolved trades...")
-        closed_markets = fetch_closed_markets(days=7, max_pages=CLOSED_MARKETS_MAX_PAGES)
-        
-        for market in closed_markets:
-            ticker = market.get('ticker')
+        settlements = fetch_portfolio_settlements(days=30, max_pages=CLOSED_MARKETS_MAX_PAGES)
+
+        for settlement in settlements:
+            ticker = settlement.get('ticker')
             if not ticker:
                 continue
             
-            settlement_value = market.get('settlement_value')
-            if settlement_value is None:
+            winner = resolve_winner_from_settlement_payload(settlement)
+            if winner is None:
                 continue  # Not settled yet
-            
-            winner = "YES" if settlement_value == 1 else "NO"
-            logger.info(f"Market {ticker} resolved: {winner} won")
+
+            settled_timestamp = normalize_settled_timestamp(settlement.get('settled_time'))
+            if settled_timestamp is None:
+                settled_timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+
+            logger.info(
+                f"Settlement {ticker}: {winner} won | market_result={settlement.get('market_result')} | "
+                f"settled_time={settlement.get('settled_time')}"
+            )
             
             # Get all open trades for this ticker
             cursor = conn.cursor()
@@ -225,7 +347,10 @@ def update_resolved_trades():
                     daily_loss += size  # Accumulate loss
                 
                 # Update the trade
-                cursor.execute("UPDATE trades SET status = ?, pnl = ? WHERE id = ?", (status, pnl, trade_id))
+                cursor.execute(
+                    "UPDATE trades SET status = ?, pnl = ?, resolved_timestamp = ? WHERE id = ?",
+                    (status, pnl, settled_timestamp, trade_id),
+                )
                 logger.info(f"Trade {trade_id} on {ticker}: {status} (${pnl:.2f})")
             
             conn.commit()
@@ -431,15 +556,15 @@ def fetch_soon_closing_markets(hours=MARKET_SCAN_HOURS, max_pages=OPEN_MARKETS_M
 
     return all_markets
 
-# Fetch recently closed markets (last 7 days)
+# Fetch recently settled markets (last N days)
 def fetch_closed_markets(days=7, max_pages=CLOSED_MARKETS_MAX_PAGES):
     current_seconds = int(time.time())
-    min_close_seconds = current_seconds - (days * 24 * 3600)
+    min_settled_seconds = current_seconds - (days * 24 * 3600)
 
     params = {
         "limit": 1000,
-        "status": "closed",
-        "min_close_ts": min_close_seconds
+        "status": "settled",
+        "min_settled_ts": min_settled_seconds
     }
 
     all_markets = []
@@ -460,7 +585,7 @@ def fetch_closed_markets(days=7, max_pages=CLOSED_MARKETS_MAX_PAGES):
         markets_page = data.get('markets', [])
         all_markets.extend(markets_page)
         cursor = data.get('cursor')
-        logger.info(f"Page {page}: {len(markets_page)} closed markets")
+        logger.info(f"Page {page}: {len(markets_page)} settled markets")
         page += 1
         if not cursor:
             break
@@ -720,6 +845,10 @@ def main_loop():
                 logger.info(f"   → No trade decision for {ticker}")
 
         update_resolved_trades()
+
+        # Send standalone rolling 24h performance as its own Discord section/message.
+        notify_rolling_24h_performance()
+        notify_all_time_performance()
 
         logger.info(f"Cycle summary | expiring ({MARKET_SCAN_HOURS}h): {total} | considered: {considered} | trades: {decided_to_trade}")
 
