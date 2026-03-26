@@ -259,6 +259,44 @@ def notify_trade_executed(
     }
     send_discord_notification(message, embed_data)
 
+
+def notify_position_closed(
+    ticker: str,
+    direction: str,
+    quantity: int,
+    entry_price: float,
+    exit_price: float,
+    pnl_dollars: float,
+    pnl_percent: float,
+    trigger: str,
+    order_status: str | None = None,
+):
+    """Send notification when a position close order is submitted."""
+    message = "📉 **Position Closed**"
+    trigger_label = "Take Profit" if trigger == "take_profit" else "Stop Loss"
+    fields = [
+        {"name": "Trigger", "value": trigger_label, "inline": True},
+    ]
+
+    if order_status:
+        fields.append({"name": "Exchange Status", "value": order_status, "inline": True})
+
+    embed_data = {
+        "title": "Exit Order Submitted",
+        "description": (
+            f"Market: {ticker}\n"
+            f"Direction: {direction}\n"
+            f"Quantity: {quantity}\n"
+            f"Entry Price: ${entry_price:.3f}\n"
+            f"Exit Price: ${exit_price:.3f}\n"
+            f"P&L: ${pnl_dollars:.2f}\n"
+            f"P&L %: {pnl_percent:.2f}%"
+        ),
+        "color": 3066993 if pnl_dollars >= 0 else 15158332,
+        "fields": fields,
+    }
+    send_discord_notification(message, embed_data)
+
 def notify_cycle_summary(total_markets: int, considered: int, trades: int, pnl_today: float, total_order_cost: float):
     """Send daily cycle summary."""
     message = f"📊 **Cycle Summary**"

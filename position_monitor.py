@@ -3,15 +3,24 @@ import sqlite3
 import requests
 import base64
 import json
+import uuid
+import threading
 from loguru import logger
 from logging_setup import setup_log_file
 from config import *
+from discord_notifications import notify_position_closed
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
 setup_log_file("monitor.log")
+
+TAKE_PROFIT_PERCENT = POSITION_TAKE_PROFIT_PERCENT
+STOP_LOSS_PERCENT = POSITION_STOP_LOSS_PERCENT
+MONITOR_INTERVAL_SECONDS = POSITION_MONITOR_INTERVAL_SECONDS
+POSITION_CLOSE_COOLDOWN_SECONDS = max(10, MONITOR_INTERVAL_SECONDS * 2)
+PENDING_CLOSE_UNTIL = {}
 
 host = "https://demo-api.kalshi.co" if MODE == "demo" else "https://api.elections.kalshi.com"
 
@@ -96,68 +105,244 @@ def get_market_price(ticker):
         logger.error(f"Failed to get market price for {ticker}: {e}")
         return 0.5
 
-def monitor_positions():
-    """Monitor current positions and calculate potential P&L"""
-    logger.info("🔍 Checking current positions...")
+
+def get_market_quotes(ticker):
+    """Return best yes/no bid prices in dollars and cents for close order pricing."""
+    try:
+        data = signed_request("GET", f"/markets/{ticker}")
+        market = data.get('market', {})
+
+        yes_bid_cents = int(market.get('yes_bid', 0) or 0)
+        no_bid_cents = int(market.get('no_bid', 0) or 0)
+        yes_ask_cents = int(market.get('yes_ask', 0) or 0)
+        no_ask_cents = int(market.get('no_ask', 0) or 0)
+
+        # If bid is unavailable, use ask as fallback to maximize chance of IOC execution.
+        if yes_bid_cents <= 0 and yes_ask_cents > 0:
+            yes_bid_cents = yes_ask_cents
+        if no_bid_cents <= 0 and no_ask_cents > 0:
+            no_bid_cents = no_ask_cents
+
+        yes_bid_cents = min(99, max(1, yes_bid_cents if yes_bid_cents > 0 else 50))
+        no_bid_cents = min(99, max(1, no_bid_cents if no_bid_cents > 0 else 50))
+
+        # Compute mark from this same payload to avoid a second /markets call.
+        if yes_bid_cents > 0 and yes_ask_cents > 0:
+            mark_yes = (yes_bid_cents + yes_ask_cents) / 200.0
+        elif yes_bid_cents > 0:
+            mark_yes = yes_bid_cents / 100.0
+        elif yes_ask_cents > 0:
+            mark_yes = yes_ask_cents / 100.0
+        else:
+            mark_yes = 0.5
+
+        return {
+            "yes_bid_cents": yes_bid_cents,
+            "no_bid_cents": no_bid_cents,
+            "yes_bid": yes_bid_cents / 100.0,
+            "no_bid": no_bid_cents / 100.0,
+            "mark_yes": mark_yes,
+        }
+    except Exception as e:
+        logger.error(f"Failed to get market quotes for {ticker}: {e}")
+        return {
+            "yes_bid_cents": 50,
+            "no_bid_cents": 50,
+            "yes_bid": 0.5,
+            "no_bid": 0.5,
+            "mark_yes": 0.5,
+        }
+
+
+def get_db_entry_for_ticker(cursor, ticker):
+    """Return latest open trade direction and entry price for ticker from local DB."""
+    cursor.execute(
+        """
+        SELECT direction, price
+        FROM trades
+        WHERE market_ticker = ? AND status = 'OPEN'
+        ORDER BY timestamp DESC, id DESC
+        LIMIT 1
+        """,
+        (ticker,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None, None
+    return row[0], float(row[1])
+
+
+def place_ioc_close_order(ticker, direction, count, quotes):
+    """Send sell-to-close IOC order for YES/NO side."""
+    side = "yes" if direction == "YES" else "no"
+    client_order_id = f"position-close-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+
+    order_body = {
+        "ticker": ticker,
+        "action": "sell",
+        "side": side,
+        "count": int(count),
+        "type": "limit",
+        "time_in_force": "immediate_or_cancel",
+        "client_order_id": client_order_id,
+    }
+
+    if side == "yes":
+        order_body["yes_price"] = int(quotes["yes_bid_cents"])
+    else:
+        order_body["no_price"] = int(quotes["no_bid_cents"])
+
+    return signed_request("POST", "/portfolio/orders", body=order_body), order_body
+
+
+def get_db_connection():
+    conn = sqlite3.connect('trades.db', timeout=5)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def notify_position_closed_async(
+    ticker,
+    direction,
+    quantity,
+    entry_price,
+    exit_price,
+    pnl_dollars,
+    pnl_percent,
+    trigger,
+    order_status,
+):
+    """Dispatch Discord notification on a daemon thread to keep monitor path non-blocking."""
+    thread = threading.Thread(
+        target=notify_position_closed,
+        kwargs={
+            "ticker": ticker,
+            "direction": direction,
+            "quantity": quantity,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "pnl_dollars": pnl_dollars,
+            "pnl_percent": pnl_percent,
+            "trigger": trigger,
+            "order_status": order_status,
+        },
+        daemon=True,
+    )
+    thread.start()
+
+
+def monitor_positions_once():
+    """Monitor live positions and submit IOC close orders at configured P&L % thresholds."""
+    logger.info("Checking open positions for take-profit/stop-loss exits...")
 
     positions = get_current_positions()
     if not positions:
         logger.info("No open positions found")
         return
 
-    conn = sqlite3.connect('trades.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-
-    total_unrealized_pnl = 0
-    profitable_positions = []
 
     for position in positions:
         ticker = position.get('ticker')
-        if not ticker:
+        raw_position = position.get('position', 0)
+
+        try:
+            contracts = int(abs(float(raw_position)))
+        except (TypeError, ValueError):
+            contracts = 0
+
+        if not ticker or contracts <= 0:
             continue
 
-        # Get our trade info from database
-        cursor.execute("""
-            SELECT direction, size, price FROM trades
-            WHERE market_ticker = ? AND status = 'OPEN'
-        """, (ticker,))
-        trade = cursor.fetchone()
-
-        if not trade:
+        api_direction = "YES" if float(raw_position) > 0 else "NO"
+        db_direction, entry_price = get_db_entry_for_ticker(cursor, ticker)
+        if entry_price is None:
+            logger.info(f"Skipping {ticker}: no OPEN entry row found in trades.db")
             continue
 
-        direction, size, entry_price = trade
-        current_price = get_market_price(ticker)
+        direction = db_direction if db_direction in {"YES", "NO"} else api_direction
+        quotes = get_market_quotes(ticker)
+        current_yes = float(quotes["mark_yes"])
+        current_no = 1.0 - current_yes
+        current_price = current_yes if direction == "YES" else current_no
 
-        # Calculate unrealized P&L
-        if direction == 'YES':
-            unrealized_pnl = size * (current_price - entry_price)
-        else:  # NO
-            unrealized_pnl = size * (entry_price - current_price)
+        unrealized_pnl = contracts * (current_price - entry_price)
+        unrealized_pnl_pct = ((current_price - entry_price) / entry_price * 100.0) if entry_price > 0 else 0.0
 
-        total_unrealized_pnl += unrealized_pnl
+        logger.info(
+            f"{ticker} | dir={direction} | contracts={contracts} | entry={entry_price:.3f} | "
+            f"mark={current_price:.3f} | unrealized_pnl=${unrealized_pnl:.2f} | pnl_pct={unrealized_pnl_pct:.2f}%"
+        )
 
-        logger.info(f"📊 {ticker} | {direction} | Size: ${size:.2f} | Entry: {entry_price:.3f} | Current: {current_price:.3f} | P&L: ${unrealized_pnl:.2f}")
+        should_take_profit = unrealized_pnl_pct >= TAKE_PROFIT_PERCENT
+        should_stop_loss = unrealized_pnl_pct <= STOP_LOSS_PERCENT
 
-        # Track profitable positions
-        if unrealized_pnl > 0.5:  # More than $0.50 profit
-            profitable_positions.append({
-                'ticker': ticker,
-                'direction': direction,
-                'size': size,
-                'pnl': unrealized_pnl
-            })
+        if not should_take_profit and not should_stop_loss:
+            continue
 
-    logger.info(f"💰 Total Unrealized P&L: ${total_unrealized_pnl:.2f}")
+        trigger = "take_profit" if should_take_profit else "stop_loss"
+        close_key = f"{ticker}:{direction}"
+        now_ts = time.time()
+        pending_until = PENDING_CLOSE_UNTIL.get(close_key, 0.0)
+        if now_ts < pending_until:
+            logger.info(
+                f"Cooldown active for {ticker} {direction}: skipping duplicate close for {pending_until - now_ts:.1f}s"
+            )
+            continue
 
-    # Note: In Kalshi, you can't sell positions - they auto-resolve
-    # This is for monitoring only
-    if profitable_positions:
-        logger.info("✅ Profitable positions:")
-        for pos in profitable_positions:
-            logger.info(f"   {pos['ticker']} | {pos['direction']} | +${pos['pnl']:.2f}")
+        logger.warning(
+            f"Exit trigger hit for {ticker}: {trigger} | pnl=${unrealized_pnl:.2f} | pnl_pct={unrealized_pnl_pct:.2f}% | "
+            f"thresholds_pct=({TAKE_PROFIT_PERCENT:.2f}%/{STOP_LOSS_PERCENT:.2f}%)"
+        )
+
+        try:
+            PENDING_CLOSE_UNTIL[close_key] = now_ts + POSITION_CLOSE_COOLDOWN_SECONDS
+            response, order_body = place_ioc_close_order(ticker, direction, contracts, quotes)
+            order_data = response.get("order", {}) if isinstance(response, dict) else {}
+            order_status = order_data.get("status") or response.get("status") if isinstance(response, dict) else None
+
+            logger.success(
+                f"Close order sent | ticker={ticker} | trigger={trigger} | body={json.dumps(order_body)} | "
+                f"response={json.dumps(response)}"
+            )
+
+            notify_position_closed_async(
+                ticker=ticker,
+                direction=direction,
+                quantity=contracts,
+                entry_price=entry_price,
+                exit_price=current_price,
+                pnl_dollars=unrealized_pnl,
+                pnl_percent=unrealized_pnl_pct,
+                trigger=trigger,
+                order_status=order_status,
+            )
+        except Exception as close_err:
+            # Allow immediate retry next loop if the close request itself failed.
+            PENDING_CLOSE_UNTIL.pop(close_key, None)
+            response = getattr(close_err, 'response', None)
+            status_code = getattr(response, 'status_code', 'unknown')
+            response_body = (getattr(response, 'text', '') or '')[:1000]
+            logger.error(
+                f"Close order failed for {ticker}: {close_err} | status={status_code} | body={response_body or 'N/A'}"
+            )
 
     conn.close()
+
+def monitor_positions():
+    """Run the exit monitor loop continuously."""
+    logger.info(
+        f"Starting position monitor loop | take_profit={TAKE_PROFIT_PERCENT:.2f}% | "
+        f"stop_loss={STOP_LOSS_PERCENT:.2f}% | interval={MONITOR_INTERVAL_SECONDS}s"
+    )
+    while True:
+        try:
+            monitor_positions_once()
+        except Exception as e:
+            logger.error(f"Unexpected monitor loop error: {e}")
+        time.sleep(MONITOR_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
     monitor_positions()

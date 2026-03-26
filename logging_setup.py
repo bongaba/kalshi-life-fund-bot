@@ -1,5 +1,6 @@
 from pathlib import Path
 import shutil
+import os
 
 from loguru import logger
 
@@ -73,10 +74,13 @@ def _move_legacy_root_logs(filename: str) -> tuple[list[Path], list[Path]]:
 def setup_log_file(filename: str, rotation: str = "1 day") -> Path:
     archived_files, skipped_files = _move_legacy_root_logs(filename)
     family_dir = _get_log_family_dir(filename)
-    log_path = family_dir / filename
+    base_name = Path(filename)
+    process_safe_name = f"{base_name.stem}.{os.getpid()}{base_name.suffix}"
+    log_path = family_dir / process_safe_name
 
     if log_path not in _CONFIGURED_LOG_FILES:
-        logger.add(str(log_path), rotation=rotation)
+        # enqueue=True makes sink writes asynchronous and safer across process boundaries.
+        logger.add(str(log_path), rotation=rotation, enqueue=True)
         _CONFIGURED_LOG_FILES.add(log_path)
 
     if archived_files:

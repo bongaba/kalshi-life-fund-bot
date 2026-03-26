@@ -97,46 +97,85 @@ def get_grok_decision(
 # {{"direction": "YES" or "NO" or "HOLD", "confidence": 0-100, "reason": "1 sentence analysis based solely on live_search-verified facts from the correct category sources"}}"""
 
 
+     # prompt = f"""Market: {market_title}
+     # Current YES price: {yes_price:.2f}
+     # Current NO price: {no_price:.2f}
+     # Volume (24h): {volume:,}
+     # Hours until close: {hours_to_close:.1f}
+     # Description: {description or 'No description available'}
+     #
+     # CRITICAL INSTRUCTIONS — FOLLOW EXACTLY:
+     #
+     # 1. FIRST, check if this is a narrow-bin/range market (words like "between", "from ... to", tight range like "88.99-89.00", "57-58", "67-68", single-degree bins, etc.).
+     #    → If yes, output ONLY this JSON and stop:
+     #    {{"direction": "HOLD", "confidence": 100, "reason": "Narrow bin/range market - prohibited by guidelines"}}
+     #
+     # 2. This market closes soon. You MUST use fresh data only.
+     #
+     # 3. For any numeric threshold market (price, temperature, percentage, etc.):
+     #    - Use the most authoritative and recent sources available.
+     #    - If multiple sources show slightly different values, calculate the median and treat them as consistent if the difference is small (less than ~0.5% or a very minor absolute gap relative to the threshold).
+     #    - If data is older than ~30 seconds, conflicting, or unclear → immediately HOLD.
+     #
+     # 4. You MUST call web_search (and x_keyword_search if relevant) BEFORE any reasoning.
+     #    Create smart, specific search queries based on the market title and closing date.
+     #
+     # 5. In your final reason, you MUST include:
+     #    - The exact source name
+     #    - The timestamp or "last updated" time of the data
+     #
+     # 6. Only recommend YES or NO if you have extremely fresh, authoritative verification with 90%+ confidence. Otherwise HOLD.
+     #
+     # GOAL: Base every single fact on the most recent tool results only. Ignore all internal knowledge.
+     #
+     # Output ONLY valid JSON. No explanations,no extra text:
+     #
+     # {{"direction": "YES" or "NO" or "HOLD", "confidence": 0-100, "reason": "1 short sentence with source and timestamp"}}"""
+
     prompt = f"""Market: {market_title}
-Current YES price: {yes_price:.2f} (implied probability)
-Current NO price: {no_price:.2f} (implied probability)
+Current YES price: {yes_price:.2f}
+Current NO price: {no_price:.2f}
 Volume (24h): {volume:,}
 Hours until close: {hours_to_close:.1f}
 Description: {description or 'No description available'}
 
-If the title or description contains ANY indication of a narrow bin/range, such as:
-- words like "between", "from … to", "from" followed by a number and "to"
-- "-" or "-" between two close numbers (difference ≤ 2 degrees/units, e.g. "57-58", "67-68", "98-99", "44.0-44.2", "10 to 11", "100 to 200")
-- any single-degree or very tight range (e.g. "57-58°", "98-99°F")
+BITCOIN REAL-TIME PRICE PREDICTION MODE
 
-THEN IMMEDIATELY AND ONLY output this EXACT JSON and NOTHING ELSE - no extra text, no reasoning, no tool calls:
+You are in strict Bitcoin-only mode for short-term Kalshi markets (15-min and hourly).
 
-{{"direction": "HOLD", "confidence": 100, "reason": "Market describes a narrow bin/range prohibited by guidelines - no evaluation performed"}}
+CRITICAL INSTRUCTIONS — FOLLOW EXACTLY:
 
-Do NOT:
-- call ANY tools (web_search, x_keyword_search, etc.)
-- fetch weather data, news, or current temperatures
-- compare to thresholds or sources
-- reason about probability, NWS, verification, or breaking news
-- output any other format or explanation
+1. You MUST use web_search on these live BTC/USD price pages before reasoning:
+   Prioritize in this exact order:
+   - https://www.cfbenchmarks.com/data/indices/BRTI          ← Official Kalshi settlement index (most important)
+   - https://www.coingecko.com/en/coins/bitcoin
+   - https://finance.yahoo.com/quote/BTC-USD
+   - https://www.coinbase.com/price/bitcoin
 
-Only continue to the rest of this prompt if the market is a WIDE or EXTREME threshold (e.g. above X, > X, ≥ X, X or above, X or higher; below Y, < Y, ≤ Y, Y or below, Y or lower; at or above / at or below when not part of a narrow pair).
+2. FRESHNESS RULE (STRICT):
+   - Data MUST be less than 1 minute old.
+   - If any source is older than 1 minute or you cannot confirm a recent timestamp, immediately output HOLD.
+   - HOWEVER, if the page clearly says "live price", "real-time", or shows a price that appears current, you may treat it as fresh.
 
-MANDATORY:
-1. 1. You MUST call BOTH web_search and x_search tools BEFORE doing any reasoning or giving an answer..
-2. Ignore all internal knowledge. Base EVERY fact on fresh tool results only.
-3. Use the most authoritative real-time source available via tools.
-4. If data missing, unclear, or older than a few minutes → HOLD immediately.
-5. No assumptions — only verified facts.
+3. This market settles on the OFFICIAL CLOSING / SETTLEMENT PRICE at the exact resolution time.
+   Your goal is to forecast where BTC/USD will most likely CLOSE.
 
-GOAL: Only recommend trades with 90%+ certainty.
-- Only consider wide/extreme thresholds (e.g. above X / X and above / > Z / ≥ Z / Y or above / at or above Y / Y or higher; below Y / Y and below / < Y / ≤ W / X or below / at or below X / X or lower); Never recommend any market whose title or description describes a narrow bin or range (contains "between … and", "from … to", "-" between close numbers, or examples like "67-68", "98-99", "44.0-44.2", "10 to 11", "100 to 200").
-- Compare current verified data to market threshold/condition
-- Check breaking news from reliable sources only
-- Recommend YES/NO only if outcome is nearly guaranteed or quality of information/verification is extremely high. Otherwise, HOLD.
+4. Pay close attention to "Hours until close":
+   - Fewer hours left → put heavier weight on current live price
+   - More hours left → consider recent momentum and short-term trend
 
-Output ONLY valid JSON. No explanations, no markdown, no code blocks — just the raw JSON object in this exact format:
-{{"direction": "YES" or "NO" or "HOLD", "confidence": 0-100, "reason": "1 sentence analysis justifying the decision"}}"""
+5. For accurate forecasting, analyze:
+   - Current live price vs the threshold
+   - Recent momentum (last 5-60 minutes)
+   - Overall market sentiment (especially from X)
+   - Breaking news and current world events
+   - Macro catalysts, ETF flows, geopolitics, risk appetite
+   - Technical support/resistance levels
+
+6. Only recommend YES or NO if you have fresh data and genuine 92%+ confidence about the expected closing price. Otherwise HOLD.
+
+Output ONLY valid JSON in this exact format. No extra text:
+{{"direction": "YES" or "NO" or "HOLD", "confidence": 0-100, "reason": "1 short sentence with current price, source, and timestamp"}}"""
     start_time = time.perf_counter()
     content = ""
 

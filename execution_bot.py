@@ -110,7 +110,9 @@ except Exception as e:
     raise
 
 # Database setup
-conn = sqlite3.connect('trades.db')
+conn = sqlite3.connect('trades.db', timeout=5)
+conn.execute("PRAGMA busy_timeout = 5000")
+conn.execute("PRAGMA journal_mode=WAL")
 conn.execute('''CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT,
@@ -750,6 +752,7 @@ def main_loop():
                     "action": action,
                     "count": count,
                     "type": "limit",
+                    "time_in_force": "immediate_or_cancel",
                     "client_order_id": client_order_id,
                 }
                 if side == "yes":
