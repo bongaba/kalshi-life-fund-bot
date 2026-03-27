@@ -764,71 +764,80 @@ def main_loop():
                     order_response = signed_request("POST", "/portfolio/orders", body=order_body)
                     kalshi_order_id, order_status = extract_order_metadata(order_response)
 
+                    order_data_resp = order_response.get('order', order_response) if isinstance(order_response, dict) else {}
+                    fill_count_fp = float(order_data_resp.get('fill_count_fp', 0) or 0)
+                    actually_filled = fill_count_fp > 0 and order_status != 'canceled'
+                    db_status = 'OPEN' if actually_filled else 'CANCELED'
+
                     logger.success(
                         f"ORDER ACCEPTED: {ticker} | client_order_id={client_order_id} | "
-                        f"kalshi_order_id={kalshi_order_id or 'unknown'} | status={order_status or 'unknown'}"
+                        f"kalshi_order_id={kalshi_order_id or 'unknown'} | status={order_status or 'unknown'} | "
+                        f"filled={fill_count_fp} | db_status={db_status}"
                     )
                     logger.debug(f"Order response for {ticker}: {json.dumps(order_response)}")
 
-                    trade_msg = (
-                        f"TRADE PLACED: {decision['direction']} on {ticker}\n"
-                        f"Quantity: {count}\n"
-                        f"Price: ${contract_price:.2f}\n"
-                        f"Total Cost: ${total_order_cost:.2f}\n"
-                        f"Reason: {decision['reason']}\n"
-                        f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-                    )
+                    if not actually_filled:
+                        logger.warning(f"IOC order for {ticker} was NOT filled (status={order_status}). Skipping DB insert.")
+                    else:
+                        trade_msg = (
+                            f"TRADE PLACED: {decision['direction']} on {ticker}\n"
+                            f"Quantity: {count}\n"
+                            f"Price: ${contract_price:.2f}\n"
+                            f"Total Cost: ${total_order_cost:.2f}\n"
+                            f"Reason: {decision['reason']}\n"
+                            f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                        )
 
-                    logger.success(trade_msg)
+                        logger.success(trade_msg)
 
-                    play_trade_notification()
+                        play_trade_notification()
 
-                    # Send Discord trade notification with exchange acknowledgement details.
-                    notify_trade_executed(
-                        ticker,
-                        title,
-                        decision['direction'],
-                        decision['confidence'],
-                        count,
-                        contract_price,
-                        decision['reason'],
-                        total_order_cost,
-                        is_undervalued=decision.get('is_undervalued', False),
-                        order_status=order_status,
-                    )
+                        # Send Discord trade notification with exchange acknowledgement details.
+                        notify_trade_executed(
+                            ticker,
+                            title,
+                            decision['direction'],
+                            decision['confidence'],
+                            count,
+                            contract_price,
+                            decision['reason'],
+                            total_order_cost,
+                            is_undervalued=decision.get('is_undervalued', False),
+                            order_status=order_status,
+                        )
 
-                    update_trade_status(ticker, 'OPEN')
+                        update_trade_status(ticker, 'OPEN')
 
-                    cursor = conn.cursor()
-                    cursor.execute('''
-                        INSERT INTO trades (
-                            timestamp,
-                            market_ticker,
-                            direction,
-                            size,
-                            price,
-                            pnl,
-                            reason,
-                            status,
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            INSERT INTO trades (
+                                timestamp,
+                                market_ticker,
+                                direction,
+                                size,
+                                price,
+                                pnl,
+                                reason,
+                                status,
+                                client_order_id,
+                                kalshi_order_id,
+                                order_status
+                            )
+                            VALUES (datetime('now'), ?, ?, ?, ?, 0.0, ?, 'OPEN', ?, ?, ?)
+                        ''', (
+                            ticker,
+                            decision['direction'],
+                            decision['size'],
+                            contract_price,
+                            decision['reason'],
                             client_order_id,
                             kalshi_order_id,
-                            order_status
-                        )
-                        VALUES (datetime('now'), ?, ?, ?, ?, 0.0, ?, 'OPEN', ?, ?, ?)
-                    ''', (
-                        ticker,
-                        decision['direction'],
-                        decision['size'],
-                        contract_price,
-                        decision['reason'],
-                        client_order_id,
-                        kalshi_order_id,
-                        order_status,
-                    ))
-                    conn.commit()
+                            order_status,
+                        ))
+                        conn.commit()
 
-                    cycle_total_order_cost += total_order_cost
-                    daily_trade_count += 1
+                        cycle_total_order_cost += total_order_cost
+                        daily_trade_count += 1
 
                 except Exception as order_err:
                     response = getattr(order_err, 'response', None)

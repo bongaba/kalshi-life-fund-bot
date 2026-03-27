@@ -1,5 +1,98 @@
 # To Do
 
+## Position Monitor Phase 1 Handoff
+
+### Completed in this phase
+
+1. Replaced the old quote helper in `position_monitor.py` with a REST-backed `QuoteEngine`.
+2. Quote validity is now strict:
+	- only executable bids are trusted
+	- a quote is valid only when `price > 0` and matching `size_fp > 0`
+3. The monitor now uses `position_fp` from Kalshi positions instead of the incorrect `position` field.
+4. P&L is now marked from the actual side-specific executable bid only:
+	- YES positions use YES bid
+	- NO positions use NO bid
+5. The monitor now keeps a per-ticker last-known-good quote cache with a 60-second freshness limit.
+6. Settlement-aware hold logic exists but is configurable:
+	- if `status` is finalized/settled/resolved/closed, the monitor will hold
+	- if `settlement_timer_seconds < 3600`, the monitor will hold
+	- if `close_time` is within 1 hour, the monitor will hold
+ 	- this gate is bypassed by default because `POSITION_MONITOR_HOLD_FOR_SETTLEMENT=false`
+7. Close orders remain IOC-only and now explicitly send `post_only: false`.
+8. Settlement hold is now configurable and defaults to disabled via:
+	- `POSITION_MONITOR_HOLD_FOR_SETTLEMENT=false`
+	- `POSITION_MONITOR_SETTLEMENT_HOLD_SECONDS=3600`
+9. Missing live exchange positions are now reconciled into `trades.db` when no local `OPEN` row exists.
+10. The quote engine now infers missing NO/YES bid sizes from complementary opposite-side ask sizes when Kalshi omits one side's size field but the binary prices line up.
+
+### Current behavior after phase 1
+
+1. Every loop still fetches positions via REST.
+2. For each non-zero position, the monitor fetches `/markets/{ticker}` via REST.
+3. The raw market payload is fed into `QuoteEngine.update()`.
+4. If a fresh executable quote exists for the held side, the monitor evaluates P&L.
+5. If the DB has no `OPEN` row for a live exchange position, the monitor backfills a reconciled `OPEN` row using the API position cost basis.
+6. If no executable quote exists, the monitor skips the position.
+7. If `POSITION_MONITOR_HOLD_FOR_SETTLEMENT=false`, the settlement-aware hold gate is bypassed.
+
+### Why this was necessary
+
+1. The old monitor could mark positions using invalid synthetic values, especially `0.50`, when Kalshi returned no usable live quotes.
+2. That caused profitable NO positions to appear as heavy losses and triggered false stop-loss exits.
+3. We also discovered a separate earlier issue where canceled IOC entries were being stored as `OPEN`; that has already been fixed in `execution_bot.py`.
+4. Some live exchange positions were missing entirely from `trades.db`, which meant the monitor had no entry price and could not compute P&L without fallback logic.
+
+### Verified live API behavior that drove this design
+
+1. `/markets/{ticker}` returns fields like:
+	- `yes_bid_dollars`
+	- `yes_bid_size_fp`
+	- `no_bid_dollars`
+	- sometimes `no_bid_size_fp` is `null` even when the complementary YES ask side is populated
+	- `close_time`
+	- `settlement_timer_seconds`
+	- `status`
+2. For problematic BTC contracts, live responses showed cases where:
+	- markets were `finalized` with no executable depth
+	- markets were still `active` but `no_bid_size_fp` was `null` while complementary `yes_ask_size_fp` was populated
+3. The monitor now treats the complementary ask size as executable depth only when the binary prices line up cleanly.
+
+### Known limitations after phase 1
+
+1. This phase is REST-first only. No WebSocket ingestion is implemented yet.
+2. The last-known-good quote cache is in-memory only. A process restart clears it.
+3. The complementary-size inference is based on observed live payload behavior and should be revalidated against Kalshi docs or more samples.
+4. There is no persistent audit trail yet for quote-cache events, stale-cache use, or consecutive invalid quote cycles.
+5. Reconciled DB rows use an API-derived average cost basis and `order_status='reconciled'`, which is safer than skipping but less authoritative than a true execution record.
+
+### Next phases to implement
+
+1. Add WebSocket-first quote ingestion for `ticker` and `orderbook_delta`.
+2. Dynamically subscribe/unsubscribe WebSocket tickers based on currently held positions.
+3. Persist `last_valid` quote cache across restarts.
+4. Add alerting when a position has no valid executable quote for multiple consecutive cycles.
+5. Add a configurable freshness window and configurable settlement hold threshold via `.env`.
+6. Confirm the exact NO-side size semantics from Kalshi docs or additional payload samples.
+7. Add a reconciliation job outside the monitor loop if you want DB backfill to happen proactively rather than only when a missing live position is encountered.
+8. Add tests around:
+	- valid quote gate
+	- complementary-size inference
+	- DB reconciliation for missing live positions
+	- stale cache behavior
+	- settlement-aware hold
+	- finalized market handling
+	- partial-fill retry behavior
+
+### Where to resume next time
+
+1. Start in `position_monitor.py`.
+2. Read the `QuoteEngine` class first.
+3. Then inspect `monitor_positions_once()` to see the exact phase-1 decision flow.
+4. If adding WebSockets next, do not replace the REST path immediately.
+	Keep REST as the fallback path and feed both sources into the same `QuoteEngine`.
+5. Preserve the non-negotiable invariant:
+	never compute P&L or fire exits from invalid, synthetic, implied, or stale prices.
+
 ## Future Support: Multivariate And Combo Markets
 
 - Current behavior intentionally skips multivariate and combo markets because the bot assumes reliable binary YES/NO pricing.

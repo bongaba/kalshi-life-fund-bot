@@ -139,43 +139,41 @@ Volume (24h): {volume:,}
 Hours until close: {hours_to_close:.1f}
 Description: {description or 'No description available'}
 
-BITCOIN REAL-TIME PRICE PREDICTION MODE
+You are in strict Bitcoin-only mode for short-term Kalshi markets. Think like a high-frequency crypto trader with perfect tool access.
 
-You are in strict Bitcoin-only mode for short-term Kalshi markets (15-min and hourly).
+CRITICAL INSTRUCTIONS — FOLLOW EXACTLY AND IN THIS ORDER:
 
-CRITICAL INSTRUCTIONS — FOLLOW EXACTLY:
+1. Before any reasoning, you MUST use the browse_page tool on these sources in exact priority order. For every call, explicitly instruct the tool to extract: current BTC price + exact timestamp / "last updated" time.
 
-1. You MUST use web_search on these live BTC/USD price pages before reasoning:
-   Prioritize in this exact order:
-   - https://www.cfbenchmarks.com/data/indices/BRTI          ← Official Kalshi settlement index (most important)
+   Priority:
+   - https://www.cfbenchmarks.com/data/indices/BRTI          ← Most important (official Kalshi settlement index)
    - https://www.coingecko.com/en/coins/bitcoin
    - https://finance.yahoo.com/quote/BTC-USD
    - https://www.coinbase.com/price/bitcoin
 
-2. FRESHNESS RULE (STRICT):
-   - Data MUST be less than 1 minute old.
-   - If any source is older than 1 minute or you cannot confirm a recent timestamp, immediately output HOLD.
-   - HOWEVER, if the page clearly says "live price", "real-time", or shows a price that appears current, you may treat it as fresh.
+2. FRESHNESS RULE (STRICT & NON-NEGOTIABLE):
+   - All price data MUST be less than 3 minutes old **OR** the source explicitly states it is "live price", "real-time", or "calculated every second" (BRTI always qualifies as real-time).
+   - If you cannot confirm freshness or real-time status, immediately output HOLD.
 
-3. This market settles on the OFFICIAL CLOSING / SETTLEMENT PRICE at the exact resolution time.
-   Your goal is to forecast where BTC/USD will most likely CLOSE.
+3. Kalshi settles on the trimmed 60-second average of the BRTI index at the exact resolution time ({hours_to_close:.1f} hours from now). Your single goal is to forecast whether THIS SPECIFIC MARKET will resolve YES or NO, based on the exact wording in the market title and description.
 
-4. Pay close attention to "Hours until close":
-   - Fewer hours left → put heavier weight on current live price
-   - More hours left → consider recent momentum and short-term trend
+4. You MUST also check current Bitcoin sentiment using x_keyword_search or x_semantic_search for posts from the last 1-minute.
 
-5. For accurate forecasting, analyze:
-   - Current live price vs the threshold
-   - Recent momentum (last 5-60 minutes)
-   - Overall market sentiment (especially from X)
-   - Breaking news and current world events
-   - Macro catalysts, ETF flows, geopolitics, risk appetite
-   - Technical support/resistance levels
+5. Pay very close attention to "Hours until close":
+   - < 10 minutes left → very heavy weight on current BRTI price + immediate momentum
+   - ≥ 10 minutes left → balance current price with short-term trend and catalysts
 
-6. Only recommend YES or NO if you have fresh data and genuine 92%+ confidence about the expected closing price. Otherwise HOLD.
+6. Analyze:
+   - Current BRTI price vs any strike (if present) or current price direction
+   - Edge compared to current YES/NO share prices
+   - Recent momentum (last 1-10 min)
+   - Real-time X sentiment
+   - Any breaking news or macro catalysts
 
-Output ONLY valid JSON in this exact format. No extra text:
-{{"direction": "YES" or "NO" or "HOLD", "confidence": 0-100, "reason": "1 short sentence with current price, source, and timestamp"}}"""
+7. Only output YES or NO if you have fresh data AND genuine 95%+ confidence in the direction. Otherwise output HOLD.
+
+Output ONLY valid JSON. No other text whatsoever:
+{{"direction": "YES" or "NO" or "HOLD", "confidence": integer 0-100, "reason": "1 short BTC Price, primary source, timestamp, and key driver"}}"""
     start_time = time.perf_counter()
     content = ""
 
