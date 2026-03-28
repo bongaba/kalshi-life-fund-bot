@@ -14,7 +14,7 @@ def sanitize_discord_text(value: str | None) -> str | None:
     return sanitized
 
 
-def get_rolling_24h_performance(db_path: str = "trades.db") -> dict:
+def get_rolling_24h_performance(db_path: str = "trades.db", account_balance: float = None) -> dict:
     """Return rolling 24-hour win/loss and PnL metrics from local trades DB."""
     metrics = {
         "wins": 0,
@@ -53,7 +53,11 @@ def get_rolling_24h_performance(db_path: str = "trades.db") -> dict:
         resolved = wins + losses
         pnl_total = float(pnl_total or 0.0)
         total_cost = float(total_cost or 0.0)
-        pnl_pct = (pnl_total / total_cost * 100.0) if total_cost > 0 else 0.0
+        # Use account balance as denominator for true portfolio return rate
+        if account_balance and account_balance > 0:
+            pnl_pct = (pnl_total / account_balance * 100.0)
+        else:
+            pnl_pct = (pnl_total / total_cost * 100.0) if total_cost > 0 else 0.0
 
         metrics.update({
             "wins": wins,
@@ -68,7 +72,7 @@ def get_rolling_24h_performance(db_path: str = "trades.db") -> dict:
     return metrics
 
 
-def get_all_time_performance(db_path: str = "trades.db") -> dict:
+def get_all_time_performance(db_path: str = "trades.db", account_balance: float = None) -> dict:
     """Return all-time win/loss and PnL metrics from local trades DB."""
     metrics = {
         "wins": 0,
@@ -100,7 +104,11 @@ def get_all_time_performance(db_path: str = "trades.db") -> dict:
         resolved = wins + losses
         pnl_total = float(pnl_total or 0.0)
         total_cost = float(total_cost or 0.0)
-        pnl_pct = (pnl_total / total_cost * 100.0) if total_cost > 0 else 0.0
+        # Use account balance as denominator for true portfolio return rate
+        if account_balance and account_balance > 0:
+            pnl_pct = (pnl_total / account_balance * 100.0)
+        else:
+            pnl_pct = (pnl_total / total_cost * 100.0) if total_cost > 0 else 0.0
 
         metrics.update({
             "wins": wins,
@@ -319,7 +327,8 @@ def notify_cycle_summary(total_markets: int, considered: int, trades: int, pnl_t
 
     # Rolling 24h performance (if enabled)
     if DISCORD_INCLUDE_ROLLING24H:
-        perf = get_rolling_24h_performance()
+        total_value = (balance + portfolio_value) if balance is not None and portfolio_value is not None else None
+        perf = get_rolling_24h_performance(account_balance=total_value)
         if perf["resolved"] > 0:
             pnl_emoji = "📈" if perf["pnl"] >= 0 else "📉"
             fields.append({
@@ -330,7 +339,8 @@ def notify_cycle_summary(total_markets: int, considered: int, trades: int, pnl_t
 
     # All-time performance (if enabled)
     if DISCORD_INCLUDE_ALL_TIME_PERFORMANCE:
-        perf_at = get_all_time_performance()
+        total_value_at = (balance + portfolio_value) if balance is not None and portfolio_value is not None else None
+        perf_at = get_all_time_performance(account_balance=total_value_at)
         if perf_at["resolved"] > 0:
             fields.append({
                 "name": "🧾 All-Time",
