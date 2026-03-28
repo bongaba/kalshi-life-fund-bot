@@ -195,7 +195,7 @@ def notify_rolling_24h_performance():
             f"P&L: ${pnl:.2f}\n"
             f"P&L %: {pnl_pct:.2f}%"
         ),
-        "color": 3066993 if pnl >= 0 else 15158332,
+        "color": 3447003,  # Blue (neutral — performance summary)
         "fields": [],
     }
     send_discord_notification(message, embed_data)
@@ -223,7 +223,7 @@ def notify_all_time_performance():
             f"P&L: ${pnl:.2f}\n"
             f"P&L %: {pnl_pct:.2f}%"
         ),
-        "color": 3066993 if pnl >= 0 else 15158332,
+        "color": 3447003,  # Blue (neutral — performance summary)
         "fields": [],
     }
     send_discord_notification(message, embed_data)
@@ -262,7 +262,7 @@ def notify_trade_executed(
             f"**Confidence:** {confidence}%\n\n"
             f"**Bought:** {quantity} × ${price:.4f} = **${total_with_fees:.2f}**"
         ),
-        "color": 3066993,  # Green
+        "color": 3447003,  # Blue (neutral — not a P&L event)
         "fields": fields
     }
     send_discord_notification(message, embed_data)
@@ -296,6 +296,9 @@ def notify_position_closed(
     if order_status:
         fields.append({"name": "Exchange Status", "value": order_status, "inline": True})
 
+    # Color by trigger: take-profit = green, stop-loss = red
+    color = 3066993 if trigger == "take_profit" else 15158332
+
     embed_data = {
         "title": "Exit Order Submitted",
         "description": (
@@ -306,7 +309,7 @@ def notify_position_closed(
             f"**Sold:** ${total_exit:.2f}\n\n"
             f"**P&L:** ${net_pnl:+.2f}"
         ),
-        "color": 3066993 if net_pnl >= 0 else 15158332,
+        "color": color,
         "fields": fields,
     }
     send_discord_notification(message, embed_data)
@@ -357,7 +360,7 @@ def notify_cycle_summary(total_markets: int, considered: int, trades: int, pnl_t
             f"Trades: {trades}\n"
             f"Cycle Cost: ${total_order_cost:.2f}"
         ),
-        "color": 3066993 if trades > 0 else 3447003,
+        "color": 3447003,  # Blue (neutral — cycle info)
         "fields": fields,
     }
     send_discord_notification(message, embed_data)
@@ -393,6 +396,6 @@ def notify_startup():
     embed_data = {
         "title": "Trading Bot Online",
         "description": "Kalshi trading bot is now active and scanning markets.",
-        "color": 5763719  # Purple
+        "color": 3447003  # Blue (neutral)
     }
     send_discord_notification(message, embed_data)

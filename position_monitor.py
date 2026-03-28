@@ -116,6 +116,10 @@ TRAILING_HIGH = {}   # YES positions: highest bid seen
 TRAILING_LOW = {}    # NO positions: lowest bid seen
 _TRAILING_MARKS_LOADED = False  # flag so we only load from DB once per process
 
+# Stop-loss confirmation: require N consecutive breaches before executing
+STOP_LOSS_CONFIRMATIONS_REQUIRED = 3
+STOP_LOSS_CONSECUTIVE_HITS = {}  # ticker -> consecutive breach count
+
 
 def _ensure_trailing_marks_table(conn):
     """Create the trailing_marks table if it doesn't exist."""
@@ -1123,6 +1127,24 @@ def monitor_positions_once():
             fee_per_contract=fee_per_contract
         )
 
+        # Stop-loss confirmation: require N consecutive breaches to filter volatility
+        if should_exit and trigger == "stop_loss":
+            hits = STOP_LOSS_CONSECUTIVE_HITS.get(ticker, 0) + 1
+            STOP_LOSS_CONSECUTIVE_HITS[ticker] = hits
+            if hits < STOP_LOSS_CONFIRMATIONS_REQUIRED:
+                logger.warning(
+                    f"{ticker}: stop-loss breach {hits}/{STOP_LOSS_CONFIRMATIONS_REQUIRED} | "
+                    f"{exit_reason} — waiting for confirmation"
+                )
+                should_exit = False
+                trigger = None
+                exit_reason = None
+            else:
+                exit_reason = f"{exit_reason} (confirmed {hits}/{STOP_LOSS_CONFIRMATIONS_REQUIRED})"
+        elif trigger != "stop_loss":
+            # Price recovered above stop — reset counter
+            STOP_LOSS_CONSECUTIVE_HITS.pop(ticker, None)
+
         # Check trailing take-profit if smart exit didn't trigger
         if not should_exit:
             should_exit, trailing_reason = check_trailing_take_profit(ticker, entry_price, current_price, direction, fee_per_contract=fee_per_contract)
@@ -1200,6 +1222,7 @@ def monitor_positions_once():
             # Clean trailing marks for closed position
             TRAILING_HIGH.pop(ticker, None)
             TRAILING_LOW.pop(ticker, None)
+            STOP_LOSS_CONSECUTIVE_HITS.pop(ticker, None)
             _delete_trailing_mark(conn, ticker)
 
             # Alert if loss exceeds -20% (severe loss on binary contract)
