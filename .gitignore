@@ -10,6 +10,8 @@ kalshi-private*
 logs/
 data/
 *.db
+*.db-shm
+*.db-wal
 *.log
 historical_*.json
 historical_model.pkl
