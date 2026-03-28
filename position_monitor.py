@@ -111,9 +111,10 @@ QUOTE_FRESHNESS_SECONDS = QUOTE_FRESHNESS_SECONDS  # loaded from config.py
 # Real-time quote cache (ticker -> latest orderbook dict)
 REALTIME_QUOTES = {}
 
-# Trailing high/low water marks for take-profit
-TRAILING_HIGH = {}   # YES positions: highest bid seen
-TRAILING_LOW = {}    # NO positions: lowest bid seen
+# Trailing high water mark for take-profit (both YES and NO positions)
+# Since current_price is always the bid for the position's side,
+# profit = current_price - entry_price for both directions.
+TRAILING_HIGH = {}   # ticker -> highest bid seen (peak profit point)
 _TRAILING_MARKS_LOADED = False  # flag so we only load from DB once per process
 
 # Stop-loss confirmation: require N consecutive breaches before executing
@@ -141,10 +142,7 @@ def _load_trailing_marks_from_db(conn):
     _ensure_trailing_marks_table(conn)
     rows = conn.execute("SELECT ticker, direction, mark_value FROM trailing_marks").fetchall()
     for ticker, direction, mark_value in rows:
-        if direction == "YES":
-            TRAILING_HIGH[ticker] = mark_value
-        else:
-            TRAILING_LOW[ticker] = mark_value
+        TRAILING_HIGH[ticker] = mark_value
     if rows:
         logger.info(f"Loaded {len(rows)} trailing mark(s) from DB")
     _TRAILING_MARKS_LOADED = True
@@ -166,110 +164,92 @@ def _delete_trailing_mark(conn, ticker):
     conn.commit()
 
 
-def compute_smart_exit(entry_price, current_price, direction, seconds_to_close, market_duration_seconds=None, fee_per_contract=0.0):
+def compute_smart_exit(entry_price, current_price, direction, seconds_to_close, market_duration_seconds=None, fee_per_contract=0.0, contracts=1):
     """Compute whether to exit based on binary contract economics.
 
     Binary contracts settle at $1.00 (win) or $0.00 (lose).
     Returns (should_exit, trigger, reason) tuple.
 
-    fee_per_contract includes entry + estimated exit fees per contract,
-    so PnL calculations reflect the true net outcome.
+    All thresholds are dollar-based, proportional to max_payout:
+      max_payout = contracts * (1.0 - entry_price) - total_fees
+    This ensures risk/reward is always balanced regardless of entry price.
 
     Strategy:
-      1. Dynamic stop-loss based on entry price and risk/reward profile.
-      2. Trailing take-profit: once price rises, protect gains
-         with a ratcheting floor rather than a fixed target.
+      1. Stop-loss: exit if unrealized_pnl <= -(max_payout * SL_PCT)
+      2. Trailing take-profit: ratcheting floor (handled separately)
     """
-    # --- Dynamic stop-loss based on entry price and risk profile ---
-    # High-entry trades (bought at $0.80+) have tiny max-gain ($0.20) but
-    # exist because the bot is highly confident. A -5% swing is normal noise.
-    # Low-entry trades (bought at $0.30) have high max-gain and should be
-    # protected more aggressively.
-    if direction == "YES":
-        pnl_pct = ((current_price - entry_price - fee_per_contract) / entry_price * 100.0) if entry_price > 0 else 0.0
-    else:
-        # NO contracts profit when price drops
-        pnl_pct = ((entry_price - current_price - fee_per_contract) / entry_price * 100.0) if entry_price > 0 else 0.0
+    # --- Max payout: total possible profit if contract settles at $1.00 ---
+    total_fees = fee_per_contract * contracts
+    max_payout = max(0.01, contracts * (1.0 - entry_price) - total_fees)
 
-    if entry_price >= 0.80:
-        # High-confidence zone: wide stop-loss, let it ride
-        stop_loss_threshold = -15.0
-        trailing_drop_pct = 5.0  # trailing take-profit: exit if drops 5% from peak
-    elif entry_price >= 0.60:
-        # Medium confidence: moderate thresholds
-        stop_loss_threshold = -10.0
-        trailing_drop_pct = 4.0
-    else:
-        # Lower confidence / speculative: tighter protection
-        stop_loss_threshold = -7.0
-        trailing_drop_pct = 3.0
+    # --- Unrealized P&L in dollars ---
+    # current_price is already the bid for the position's side (YES bid or NO bid),
+    # so profit = current - entry for both directions.
+    unrealized_pnl = contracts * (current_price - entry_price) - total_fees
 
-    # --- Hard stop-loss ---
-    if pnl_pct <= stop_loss_threshold:
-        return True, "stop_loss", f"pnl {pnl_pct:.1f}% breached dynamic stop {stop_loss_threshold:.0f}%"
+    # --- Stop-loss: cap loss as % of max_payout ---
+    SL_PCT = 0.15  # lose at most 15% of what you could have won
+    MIN_STOP_DISTANCE = 0.02  # minimum $0.02/contract price drop before stop
+    sl_dollar = max_payout * SL_PCT
+    # Enforce minimum stop distance so tiny max-profit positions aren't stopped by noise
+    sl_dollar = max(sl_dollar, contracts * MIN_STOP_DISTANCE)
 
-    # --- Trailing take-profit ---
-    # Don't use a fixed take-profit ceiling. Instead, once the price goes up,
-    # we ratchet a floor. The floor = high_water * (1 - trailing_drop_pct/100).
-    # This lets winners run toward settlement while locking in gains.
-    # (Trailing high is updated by the caller and passed in via TRAILING_HIGH dict.)
+    if unrealized_pnl <= -sl_dollar:
+        return True, "stop_loss", (
+            f"pnl ${unrealized_pnl:.2f} breached stop -${sl_dollar:.2f} "
+            f"(max_payout=${max_payout:.2f}, sl={SL_PCT:.0%})"
+        )
 
     return False, None, None
 
 
 def update_trailing_mark(ticker, current_price, direction="YES", conn=None):
-    """Update the high-water (YES) or low-water (NO) mark for trailing take-profit."""
-    if direction == "YES":
-        prev = TRAILING_HIGH.get(ticker, 0.0)
-        if current_price > prev:
-            TRAILING_HIGH[ticker] = current_price
-            if conn:
-                _save_trailing_mark(conn, ticker, direction, current_price)
-        return TRAILING_HIGH.get(ticker, current_price)
-    else:
-        prev = TRAILING_LOW.get(ticker, float('inf'))
-        if current_price < prev:
-            TRAILING_LOW[ticker] = current_price
-            if conn:
-                _save_trailing_mark(conn, ticker, direction, current_price)
-        return TRAILING_LOW.get(ticker, current_price)
+    """Update the high-water mark for trailing take-profit.
+
+    Both YES and NO positions track the highest bid seen, since current_price
+    is already in the correct terms for each side.
+    """
+    prev = TRAILING_HIGH.get(ticker, 0.0)
+    if current_price > prev:
+        TRAILING_HIGH[ticker] = current_price
+        if conn:
+            _save_trailing_mark(conn, ticker, direction, current_price)
+    return TRAILING_HIGH.get(ticker, current_price)
 
 
-def check_trailing_take_profit(ticker, entry_price, current_price, direction="YES", fee_per_contract=0.0):
+def check_trailing_take_profit(ticker, entry_price, current_price, direction="YES", fee_per_contract=0.0, contracts=1):
     """Check if price has dropped from peak enough to trigger trailing take-profit.
+
+    Uses a dollar-based trailing drop: 5% of total max_payout.
+    The trailing drop is converted to a per-contract price distance so it can
+    be compared against the price watermarks.
 
     Once a position is in profit, the trailing floor is clamped to at minimum
     the breakeven price (entry + fees).  This guarantees we never exit into a
     net loss after fees are applied.
     """
-    # Trailing thresholds (same tiers as compute_smart_exit)
-    if entry_price >= 0.80:
-        trailing_pct = 5.0
-    elif entry_price >= 0.60:
-        trailing_pct = 4.0
-    else:
-        trailing_pct = 3.0
+    # Trailing drop: 15% of total max_payout, converted to per-contract price distance
+    TRAILING_DROP_PCT = 0.15
+    total_fees = fee_per_contract * contracts
+    max_payout = max(0.01, contracts * (1.0 - entry_price) - total_fees)
+    trailing_drop_dollars = max_payout * TRAILING_DROP_PCT
+    # Convert total dollar drop to per-contract price distance
+    trailing_drop = trailing_drop_dollars / contracts if contracts > 0 else 0.02
+    # Minimum trailing distance to avoid noise exits
+    trailing_drop = max(trailing_drop, 0.02)
 
-    # Breakeven = entry price + round-trip fees per contract
-    breakeven = entry_price + fee_per_contract
+    # Breakeven = entry price + round-trip fees per contract + safety buffer
+    FEE_SAFETY_BUFFER = 0.01
+    breakeven = entry_price + fee_per_contract + FEE_SAFETY_BUFFER
 
-    if direction == "YES":
-        high = TRAILING_HIGH.get(ticker, current_price)
-        if high <= breakeven:
-            return False, None  # never been above breakeven
-        # Floor = peak minus trailing %, but NEVER below breakeven
-        floor = max(breakeven, high * (1.0 - trailing_pct / 100.0))
-        if current_price <= floor:
-            return True, f"trailing TP: peak=${high:.3f} floor=${floor:.3f} breakeven=${breakeven:.3f} now=${current_price:.3f}"
-    else:
-        low = TRAILING_LOW.get(ticker, current_price)
-        breakeven_no = entry_price - fee_per_contract  # NO profits when price drops
-        if low >= breakeven_no:
-            return False, None  # never been below breakeven
-        # Ceiling = trough plus trailing %, but NEVER above breakeven
-        ceiling = min(breakeven_no, low * (1.0 + trailing_pct / 100.0))
-        if current_price >= ceiling:
-            return True, f"trailing TP: trough=${low:.3f} ceiling=${ceiling:.3f} breakeven=${breakeven_no:.3f} now=${current_price:.3f}"
+    # Both YES and NO use the same logic: track peak, exit if drops from peak
+    high = TRAILING_HIGH.get(ticker, current_price)
+    if high <= breakeven:
+        return False, None  # never been above breakeven
+    # Floor = peak minus trailing drop, but NEVER below breakeven
+    floor = max(breakeven, high - trailing_drop)
+    if current_price <= floor:
+        return True, f"trailing TP: peak=${high:.3f} floor=${floor:.3f} breakeven=${breakeven:.3f} now=${current_price:.3f} (trail=${trailing_drop:.4f})"
     return False, None
 
 # --- WebSocket orderbook state ---
@@ -1090,7 +1070,7 @@ def monitor_positions_once():
                 if quote_reason.startswith("stale"):
                     logger.error(f"ALERT: Skipping {ticker} {direction} due to stale quote ({quote_reason}). WebSocket may be lagging or disconnected.")
                 else:
-                    logger.error(f"ALERT: Skipping {ticker} {direction} due to missing real-time quote ({quote_reason}). WebSocket/API may be down.")
+                    logger.warning(f"Skipping {ticker} {direction}: no real-time quote ({quote_reason}). Market may be thin.")
             continue
 
         if hold_for_settlement:
@@ -1124,7 +1104,7 @@ def monitor_positions_once():
         # Smart exit decision
         should_exit, trigger, exit_reason = compute_smart_exit(
             entry_price, current_price, direction, seconds_to_close, market_duration_seconds,
-            fee_per_contract=fee_per_contract
+            fee_per_contract=fee_per_contract, contracts=contracts
         )
 
         # Stop-loss confirmation: require N consecutive breaches to filter volatility
@@ -1147,13 +1127,13 @@ def monitor_positions_once():
 
         # Check trailing take-profit if smart exit didn't trigger
         if not should_exit:
-            should_exit, trailing_reason = check_trailing_take_profit(ticker, entry_price, current_price, direction, fee_per_contract=fee_per_contract)
+            should_exit, trailing_reason = check_trailing_take_profit(ticker, entry_price, current_price, direction, fee_per_contract=fee_per_contract, contracts=contracts)
             if should_exit:
                 trigger = "take_profit"
                 exit_reason = trailing_reason
 
         ttc_str = f"{seconds_to_close:.0f}s" if seconds_to_close is not None else "unknown"
-        trail_str = f"${TRAILING_HIGH.get(ticker, 0):.3f}" if direction == "YES" else f"${TRAILING_LOW.get(ticker, float('inf')):.3f}"
+        trail_str = f"${TRAILING_HIGH.get(ticker, 0):.3f}"
 
         logger.info(
             f"{ticker} | dir={direction} | contracts={contracts} | entry={entry_price:.3f} | "
@@ -1221,7 +1201,6 @@ def monitor_positions_once():
 
             # Clean trailing marks for closed position
             TRAILING_HIGH.pop(ticker, None)
-            TRAILING_LOW.pop(ticker, None)
             STOP_LOSS_CONSECUTIVE_HITS.pop(ticker, None)
             _delete_trailing_mark(conn, ticker)
 
