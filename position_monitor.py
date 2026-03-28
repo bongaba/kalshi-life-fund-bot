@@ -1117,19 +1117,34 @@ def monitor_positions_once():
         )
 
         # Stop-loss confirmation: require N consecutive breaches to filter volatility
+        # BUT: skip confirmations for severe breaches (2x+ threshold) — exit immediately
         if should_exit and trigger == "stop_loss":
-            hits = STOP_LOSS_CONSECUTIVE_HITS.get(ticker, 0) + 1
-            STOP_LOSS_CONSECUTIVE_HITS[ticker] = hits
-            if hits < STOP_LOSS_CONFIRMATIONS_REQUIRED:
+            # Parse the unrealized PnL and SL threshold from the exit reason to check severity
+            total_fees = fee_per_contract * contracts
+            max_payout = max(0.01, contracts * (1.0 - entry_price) - total_fees)
+            unrealized_pnl = contracts * (current_price - entry_price) - total_fees
+            sl_dollar = max(max_payout * 0.15, contracts * 0.02)
+            severe_breach = unrealized_pnl <= -(sl_dollar * 2)  # loss is 2x+ the threshold
+
+            if severe_breach:
                 logger.warning(
-                    f"{ticker}: stop-loss breach {hits}/{STOP_LOSS_CONFIRMATIONS_REQUIRED} | "
-                    f"{exit_reason} — waiting for confirmation"
+                    f"{ticker}: SEVERE stop-loss breach (pnl=${unrealized_pnl:.2f} vs threshold -${sl_dollar:.2f}) — "
+                    f"skipping confirmation, exiting immediately"
                 )
-                should_exit = False
-                trigger = None
-                exit_reason = None
+                exit_reason = f"{exit_reason} (severe breach — immediate exit)"
             else:
-                exit_reason = f"{exit_reason} (confirmed {hits}/{STOP_LOSS_CONFIRMATIONS_REQUIRED})"
+                hits = STOP_LOSS_CONSECUTIVE_HITS.get(ticker, 0) + 1
+                STOP_LOSS_CONSECUTIVE_HITS[ticker] = hits
+                if hits < STOP_LOSS_CONFIRMATIONS_REQUIRED:
+                    logger.warning(
+                        f"{ticker}: stop-loss breach {hits}/{STOP_LOSS_CONFIRMATIONS_REQUIRED} | "
+                        f"{exit_reason} — waiting for confirmation"
+                    )
+                    should_exit = False
+                    trigger = None
+                    exit_reason = None
+                else:
+                    exit_reason = f"{exit_reason} (confirmed {hits}/{STOP_LOSS_CONFIRMATIONS_REQUIRED})"
         elif trigger != "stop_loss":
             # Price recovered above stop — reset counter
             STOP_LOSS_CONSECUTIVE_HITS.pop(ticker, None)
