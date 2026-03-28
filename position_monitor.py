@@ -888,10 +888,19 @@ def mark_fills_closed(cursor, ticker, exit_price, trigger):
     return cursor.rowcount
 
 
-def place_ioc_close_order(ticker, direction, count, executable_quote):
-    """Send sell-to-close IOC order for YES/NO side."""
+def place_ioc_close_order(ticker, direction, count, executable_quote, slippage_pct=0.0):
+    """Send sell-to-close IOC order for YES/NO side.
+    
+    slippage_pct: percentage below the bid to price the order (e.g. 0.02 = 2%).
+    A higher value increases fill probability at the cost of worse price.
+    On Kalshi, you still get price improvement if a higher bid exists.
+    """
     side = "yes" if direction == "YES" else "no"
     client_order_id = f"position-close-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+
+    bid_cents = int(round(executable_quote["bid"] * 100))
+    slippage_cents = int(round(bid_cents * slippage_pct))
+    aggressive_price = max(1, bid_cents - slippage_cents)  # floor at $0.01
 
     order_body = {
         "ticker": ticker,
@@ -905,9 +914,9 @@ def place_ioc_close_order(ticker, direction, count, executable_quote):
     }
 
     if side == "yes":
-        order_body["yes_price"] = int(round(executable_quote["bid"] * 100))
+        order_body["yes_price"] = aggressive_price
     else:
-        order_body["no_price"] = int(round(executable_quote["bid"] * 100))
+        order_body["no_price"] = aggressive_price
 
     return signed_request("POST", "/portfolio/orders", body=order_body), order_body
 
@@ -1162,16 +1171,40 @@ def monitor_positions_once():
 
 
         try:
-            # Atomic close: fetch a fresh real-time quote before submitting close order
-            fresh_quote, fresh_reason = get_realtime_executable_quote(ticker, direction)
-            if not fresh_quote:
-                logger.error(f"Atomic close failed: no fresh quote for {ticker} {direction} (reason={fresh_reason})")
-                PENDING_CLOSE_UNTIL.pop(close_key, None)
+            # Percentage-based slippage: scales with price so you never give up too much
+            # Stop-losses are more aggressive to guarantee a fill
+            if trigger == "stop_loss":
+                slippage_schedule = [0.02, 0.04, 0.06]  # 2%, 4%, 6% below bid
+            else:
+                slippage_schedule = [0.01, 0.02, 0.04]  # 1%, 2%, 4% below bid
+
+            order_filled = False
+            for attempt, slippage in enumerate(slippage_schedule, 1):
+                fresh_quote, fresh_reason = get_realtime_executable_quote(ticker, direction)
+                if not fresh_quote:
+                    logger.error(f"Atomic close failed: no fresh quote for {ticker} {direction} (reason={fresh_reason})")
+                    break
+
+                PENDING_CLOSE_UNTIL[close_key] = now_ts + POSITION_CLOSE_COOLDOWN_SECONDS
+                response, order_body = place_ioc_close_order(ticker, direction, contracts, fresh_quote, slippage_pct=slippage)
+                order_data = response.get("order", {}) if isinstance(response, dict) else {}
+                order_status = order_data.get("status") or response.get("status") if isinstance(response, dict) else None
+
+                if order_status in ("canceled", "cancelled"):
+                    slippage_cents = int(round(fresh_quote['bid'] * 100 * slippage))
+                    logger.warning(
+                        f"IOC close attempt {attempt}/{len(slippage_schedule)} for {ticker} canceled "
+                        f"(slippage={slippage:.0%} = {slippage_cents}¢). {'Retrying...' if attempt < len(slippage_schedule) else 'Will retry next cycle.'}"
+                    )
+                    time.sleep(0.3)  # Brief pause between retries
+                    continue
+
+                order_filled = True
+                break
+
+            if not order_filled:
+                PENDING_CLOSE_UNTIL.pop(close_key, None)  # Allow retry next cycle
                 continue
-            PENDING_CLOSE_UNTIL[close_key] = now_ts + POSITION_CLOSE_COOLDOWN_SECONDS
-            response, order_body = place_ioc_close_order(ticker, direction, contracts, fresh_quote)
-            order_data = response.get("order", {}) if isinstance(response, dict) else {}
-            order_status = order_data.get("status") or response.get("status") if isinstance(response, dict) else None
 
             # Fetch actual fill price and fees from exchange
             sell_side = "yes" if direction == "YES" else "no"
