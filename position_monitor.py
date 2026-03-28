@@ -1,3 +1,83 @@
+# --- Real-time quote access ---
+# WebSocket quotes are trusted for longer — the book is maintained incrementally
+# via snapshots + deltas so it should always reflect the true state.
+WS_QUOTE_FRESHNESS_SECONDS = 30  # WS-maintained book stays valid much longer
+REST_FALLBACK_COOLDOWN = {}      # ticker -> last REST fetch timestamp (avoid spamming)
+REST_FALLBACK_MIN_INTERVAL = 10  # seconds between REST fallback calls per ticker
+
+def get_realtime_executable_quote(ticker, direction):
+    """Get the best executable bid for selling a position.
+
+    Primary source: WebSocket-maintained orderbook (trusted for WS_QUOTE_FRESHNESS_SECONDS).
+    Fallback: REST API only when WS has never provided data or is very stale.
+    """
+    def _extract_best_bid(orders):
+        """Return the highest-priced order (best bid for a seller)."""
+        if not orders:
+            return None
+        # Orders are sorted ascending; best bid for selling = last entry
+        best = orders[-1]
+        return {
+            "bid": float(best[0]),
+            "size": float(best[1]),
+        }
+
+    # Try WebSocket cache first (primary source)
+    q = REALTIME_QUOTES.get(ticker)
+    if q:
+        age = (datetime.now(timezone.utc) - q["timestamp"]).total_seconds()
+        if age <= WS_QUOTE_FRESHNESS_SECONDS:
+            if direction == "YES":
+                result = _extract_best_bid(q.get("yes_dollars", []))
+            else:
+                result = _extract_best_bid(q.get("no_dollars", []))
+            if result:
+                result["timestamp"] = q["timestamp"]
+                result["source"] = "websocket"
+                return result, "executable_bid"
+            # WS book exists but no bids on our side — still valid data (market is thin)
+            if age <= QUOTE_FRESHNESS_SECONDS:
+                return None, f"no_{direction.lower()}_bids_in_ws_book"
+
+    # Fallback to REST API — only if WS hasn't provided data or is very stale
+    now_ts = time.time()
+    last_rest = REST_FALLBACK_COOLDOWN.get(ticker, 0)
+    if now_ts - last_rest < REST_FALLBACK_MIN_INTERVAL:
+        return None, "rest_cooldown"
+
+    try:
+        logger.warning(f"WS book stale/missing for {ticker}, falling back to REST API")
+        REST_FALLBACK_COOLDOWN[ticker] = now_ts
+        data = signed_request("GET", f"/markets/{ticker}/orderbook")
+        orderbook = data.get("orderbook_fp", data)
+        yes_orders = orderbook.get("yes_dollars", [])
+        no_orders = orderbook.get("no_dollars", [])
+        timestamp = datetime.now(timezone.utc)
+
+        # Seed the WS orderbook so deltas can build on it
+        WS_ORDERBOOKS[ticker] = {
+            "yes": {float(p): float(s) for p, s in yes_orders} if yes_orders else {},
+            "no": {float(p): float(s) for p, s in no_orders} if no_orders else {},
+        }
+        REALTIME_QUOTES[ticker] = {
+            "yes_dollars": yes_orders,
+            "no_dollars": no_orders,
+            "timestamp": timestamp
+        }
+
+        if direction == "YES":
+            result = _extract_best_bid(yes_orders)
+        else:
+            result = _extract_best_bid(no_orders)
+        if result:
+            result["timestamp"] = timestamp
+            result["source"] = "rest_fallback"
+            return result, "executable_bid"
+        return None, f"no_{direction.lower()}_bids_in_orderbook"
+    except Exception as e:
+        logger.debug(f"Failed to fetch orderbook for {ticker}: {e}")
+    return None, "api_failed"
+
 import time
 import sqlite3
 import requests
@@ -15,18 +95,276 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 
+# WebSocket integration
+from kalshi_ws_client import KalshiWebSocketClient
+import os
+import asyncio
+
 setup_log_file("monitor.log")
 
 TAKE_PROFIT_PERCENT = POSITION_TAKE_PROFIT_PERCENT
 STOP_LOSS_PERCENT = POSITION_STOP_LOSS_PERCENT
 MONITOR_INTERVAL_SECONDS = POSITION_MONITOR_INTERVAL_SECONDS
 POSITION_CLOSE_COOLDOWN_SECONDS = max(10, MONITOR_INTERVAL_SECONDS * 2)
-QUOTE_FRESHNESS_SECONDS = 5
+QUOTE_FRESHNESS_SECONDS = QUOTE_FRESHNESS_SECONDS  # loaded from config.py
+
+# Real-time quote cache (ticker -> latest orderbook dict)
+REALTIME_QUOTES = {}
+
+# Trailing high/low water marks for take-profit
+TRAILING_HIGH = {}   # YES positions: highest bid seen
+TRAILING_LOW = {}    # NO positions: lowest bid seen
+_TRAILING_MARKS_LOADED = False  # flag so we only load from DB once per process
+
+
+def _ensure_trailing_marks_table(conn):
+    """Create the trailing_marks table if it doesn't exist."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trailing_marks (
+            ticker TEXT PRIMARY KEY,
+            direction TEXT NOT NULL,
+            mark_value REAL NOT NULL
+        )
+    """)
+    conn.commit()
+
+
+def _load_trailing_marks_from_db(conn):
+    """Load persisted trailing marks into in-memory dicts (once per process)."""
+    global _TRAILING_MARKS_LOADED
+    if _TRAILING_MARKS_LOADED:
+        return
+    _ensure_trailing_marks_table(conn)
+    rows = conn.execute("SELECT ticker, direction, mark_value FROM trailing_marks").fetchall()
+    for ticker, direction, mark_value in rows:
+        if direction == "YES":
+            TRAILING_HIGH[ticker] = mark_value
+        else:
+            TRAILING_LOW[ticker] = mark_value
+    if rows:
+        logger.info(f"Loaded {len(rows)} trailing mark(s) from DB")
+    _TRAILING_MARKS_LOADED = True
+
+
+def _save_trailing_mark(conn, ticker, direction, mark_value):
+    """Upsert a trailing mark to the DB."""
+    conn.execute(
+        "INSERT INTO trailing_marks (ticker, direction, mark_value) VALUES (?, ?, ?) "
+        "ON CONFLICT(ticker) DO UPDATE SET mark_value = excluded.mark_value",
+        (ticker, direction, mark_value),
+    )
+    conn.commit()
+
+
+def _delete_trailing_mark(conn, ticker):
+    """Remove a trailing mark from the DB."""
+    conn.execute("DELETE FROM trailing_marks WHERE ticker = ?", (ticker,))
+    conn.commit()
+
+
+def compute_smart_exit(entry_price, current_price, direction, seconds_to_close, market_duration_seconds=None, fee_per_contract=0.0):
+    """Compute whether to exit based on binary contract economics.
+
+    Binary contracts settle at $1.00 (win) or $0.00 (lose).
+    Returns (should_exit, trigger, reason) tuple.
+
+    fee_per_contract includes entry + estimated exit fees per contract,
+    so PnL calculations reflect the true net outcome.
+
+    Strategy:
+      1. Dynamic stop-loss based on entry price and risk/reward profile.
+      2. Trailing take-profit: once price rises, protect gains
+         with a ratcheting floor rather than a fixed target.
+    """
+    # --- Dynamic stop-loss based on entry price and risk profile ---
+    # High-entry trades (bought at $0.80+) have tiny max-gain ($0.20) but
+    # exist because the bot is highly confident. A -5% swing is normal noise.
+    # Low-entry trades (bought at $0.30) have high max-gain and should be
+    # protected more aggressively.
+    if direction == "YES":
+        pnl_pct = ((current_price - entry_price - fee_per_contract) / entry_price * 100.0) if entry_price > 0 else 0.0
+    else:
+        # NO contracts profit when price drops
+        pnl_pct = ((entry_price - current_price - fee_per_contract) / entry_price * 100.0) if entry_price > 0 else 0.0
+
+    if entry_price >= 0.80:
+        # High-confidence zone: wide stop-loss, let it ride
+        stop_loss_threshold = -15.0
+        trailing_drop_pct = 5.0  # trailing take-profit: exit if drops 5% from peak
+    elif entry_price >= 0.60:
+        # Medium confidence: moderate thresholds
+        stop_loss_threshold = -10.0
+        trailing_drop_pct = 4.0
+    else:
+        # Lower confidence / speculative: tighter protection
+        stop_loss_threshold = -7.0
+        trailing_drop_pct = 3.0
+
+    # --- Hard stop-loss ---
+    if pnl_pct <= stop_loss_threshold:
+        return True, "stop_loss", f"pnl {pnl_pct:.1f}% breached dynamic stop {stop_loss_threshold:.0f}%"
+
+    # --- Trailing take-profit ---
+    # Don't use a fixed take-profit ceiling. Instead, once the price goes up,
+    # we ratchet a floor. The floor = high_water * (1 - trailing_drop_pct/100).
+    # This lets winners run toward settlement while locking in gains.
+    # (Trailing high is updated by the caller and passed in via TRAILING_HIGH dict.)
+
+    return False, None, None
+
+
+def update_trailing_mark(ticker, current_price, direction="YES", conn=None):
+    """Update the high-water (YES) or low-water (NO) mark for trailing take-profit."""
+    if direction == "YES":
+        prev = TRAILING_HIGH.get(ticker, 0.0)
+        if current_price > prev:
+            TRAILING_HIGH[ticker] = current_price
+            if conn:
+                _save_trailing_mark(conn, ticker, direction, current_price)
+        return TRAILING_HIGH.get(ticker, current_price)
+    else:
+        prev = TRAILING_LOW.get(ticker, float('inf'))
+        if current_price < prev:
+            TRAILING_LOW[ticker] = current_price
+            if conn:
+                _save_trailing_mark(conn, ticker, direction, current_price)
+        return TRAILING_LOW.get(ticker, current_price)
+
+
+def check_trailing_take_profit(ticker, entry_price, current_price, direction="YES", fee_per_contract=0.0):
+    """Check if price has dropped from peak enough to trigger trailing take-profit.
+
+    Once a position is in profit, the trailing floor is clamped to at minimum
+    the breakeven price (entry + fees).  This guarantees we never exit into a
+    net loss after fees are applied.
+    """
+    # Trailing thresholds (same tiers as compute_smart_exit)
+    if entry_price >= 0.80:
+        trailing_pct = 5.0
+    elif entry_price >= 0.60:
+        trailing_pct = 4.0
+    else:
+        trailing_pct = 3.0
+
+    # Breakeven = entry price + round-trip fees per contract
+    breakeven = entry_price + fee_per_contract
+
+    if direction == "YES":
+        high = TRAILING_HIGH.get(ticker, current_price)
+        if high <= breakeven:
+            return False, None  # never been above breakeven
+        # Floor = peak minus trailing %, but NEVER below breakeven
+        floor = max(breakeven, high * (1.0 - trailing_pct / 100.0))
+        if current_price <= floor:
+            return True, f"trailing TP: peak=${high:.3f} floor=${floor:.3f} breakeven=${breakeven:.3f} now=${current_price:.3f}"
+    else:
+        low = TRAILING_LOW.get(ticker, current_price)
+        breakeven_no = entry_price - fee_per_contract  # NO profits when price drops
+        if low >= breakeven_no:
+            return False, None  # never been below breakeven
+        # Ceiling = trough plus trailing %, but NEVER above breakeven
+        ceiling = min(breakeven_no, low * (1.0 + trailing_pct / 100.0))
+        if current_price >= ceiling:
+            return True, f"trailing TP: trough=${low:.3f} ceiling=${ceiling:.3f} breakeven=${breakeven_no:.3f} now=${current_price:.3f}"
+    return False, None
+
+# --- WebSocket orderbook state ---
+# Full orderbook per ticker: { ticker: { "yes": {price: size, ...}, "no": {price: size, ...} } }
+WS_ORDERBOOKS = {}
+
+def _book_to_sorted_list(book_dict):
+    """Convert {price: size} dict → [[price, size], ...] sorted ascending by price."""
+    return sorted([[p, s] for p, s in book_dict.items() if s > 0], key=lambda x: x[0])
+
+
+def handle_orderbook_ws(ticker, msg_type, data):
+    """Handle orderbook_snapshot and orderbook_delta from Kalshi WS.
+
+    Snapshots replace the entire book.  Deltas merge into the existing book
+    (size=0 removes a price level).
+    """
+    yes_levels = data.get("yes", [])
+    no_levels = data.get("no", [])
+
+    if msg_type == "orderbook_snapshot":
+        # Full replacement
+        yes_book = {float(p): float(s) for p, s in yes_levels} if yes_levels else {}
+        no_book = {float(p): float(s) for p, s in no_levels} if no_levels else {}
+        WS_ORDERBOOKS[ticker] = {"yes": yes_book, "no": no_book}
+    else:
+        # Delta: merge into existing book
+        existing = WS_ORDERBOOKS.get(ticker, {"yes": {}, "no": {}})
+        for p, s in (yes_levels or []):
+            price, size = float(p), float(s)
+            if size <= 0:
+                existing["yes"].pop(price, None)
+            else:
+                existing["yes"][price] = size
+        for p, s in (no_levels or []):
+            price, size = float(p), float(s)
+            if size <= 0:
+                existing["no"].pop(price, None)
+            else:
+                existing["no"][price] = size
+        WS_ORDERBOOKS[ticker] = existing
+
+    # Build sorted arrays and push to REALTIME_QUOTES
+    book = WS_ORDERBOOKS[ticker]
+    yes_sorted = _book_to_sorted_list(book["yes"])
+    no_sorted = _book_to_sorted_list(book["no"])
+
+    REALTIME_QUOTES[ticker] = {
+        "yes_dollars": yes_sorted,
+        "no_dollars": no_sorted,
+        "timestamp": datetime.now(timezone.utc)
+    }
+
+    # --- Live order flow logging ---
+    yes_best = yes_sorted[-1] if yes_sorted else None
+    no_best = no_sorted[-1] if no_sorted else None
+    delta_tag = "SNAP" if msg_type == "orderbook_snapshot" else "DELTA"
+    parts = [f"[{delta_tag}] {ticker}"]
+    if yes_best:
+        parts.append(f"YES best_bid=${yes_best[0]:.2f}×{yes_best[1]:.0f}")
+    if no_best:
+        parts.append(f"NO best_bid=${no_best[0]:.2f}×{no_best[1]:.0f}")
+    parts.append(f"depth=Y{len(yes_sorted)}/N{len(no_sorted)}")
+    if yes_levels or no_levels:
+        changes = []
+        for p, s in (yes_levels or []):
+            changes.append(f"Y${float(p):.2f}→{float(s):.0f}")
+        for p, s in (no_levels or []):
+            changes.append(f"N${float(p):.2f}→{float(s):.0f}")
+        parts.append(f"changes=[{', '.join(changes)}]")
+    logger.info(" | ".join(parts))
+
+# Start the WebSocket client in a background thread and allow dynamic subscription
+WS_CLIENT = None
+def start_ws_client(tickers):
+    global WS_CLIENT
+    api_key_id = os.getenv("KALSHI_API_KEY_ID")
+    private_key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH")
+    if not api_key_id or not private_key_path:
+        logger.error("KALSHI_API_KEY_ID and/or KALSHI_PRIVATE_KEY_PATH are missing from .env! WebSocket will not work.")
+    # Add a known active ticker for diagnostics (replace with a real active ticker if needed)
+    diagnostic_ticker = None  # "PI_XBTUSD"  # Example: Bitcoin market, adjust as needed
+    all_tickers = set(tickers)
+    if diagnostic_ticker:
+        all_tickers.add(diagnostic_ticker)
+    logger.info(f"Subscribing to tickers at startup: {sorted(all_tickers)}")
+    WS_CLIENT = KalshiWebSocketClient(api_key_id, private_key_path, all_tickers, handle_orderbook_ws)
+    def run():
+        asyncio.run(WS_CLIENT.connect())
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    logger.info("Started Kalshi WebSocket client thread for real-time quotes.")
 SETTLEMENT_HOLD_ENABLED = POSITION_MONITOR_HOLD_FOR_SETTLEMENT
 SETTLEMENT_HOLD_SECONDS = POSITION_MONITOR_SETTLEMENT_HOLD_SECONDS
 PENDING_CLOSE_UNTIL = {}
+RECONCILED_SETTLED_TICKERS = set()  # Track tickers already marked settled to avoid log spam
 
 host = "https://demo-api.kalshi.co" if MODE == "demo" else "https://api.elections.kalshi.com"
+api_prefix = "/trade-api/v2"
 
 # Load private key
 private_key = None
@@ -56,11 +394,11 @@ def create_signature(private_key, timestamp, method, path):
 def signed_request(method, path, params=None, body=None):
     timestamp = str(int(time.time() * 1000))
 
-    full_path = "/trade-api/v2" + path
+    full_path = api_prefix + path
     if params:
         full_path += "?" + "&".join(f"{k}={v}" for k, v in params.items())
 
-    sign_path = ("/trade-api/v2" + path).split('?')[0]
+    sign_path = (api_prefix + path).split('?')[0]
     message = f"{timestamp}{method.upper()}{sign_path}"
 
     signature = create_signature(private_key, timestamp, method.upper(), sign_path)
@@ -84,6 +422,40 @@ def signed_request(method, path, params=None, body=None):
     response.raise_for_status()
     return response.json()
 
+
+def fetch_fill_price_and_fees(order_id, side):
+    """Fetch actual fill price and fees from Kalshi fills endpoint.
+
+    Returns (avg_fill_price, total_fees) or (None, 0.0) on failure.
+    """
+    try:
+        resp = signed_request('GET', '/portfolio/fills', params={'order_id': order_id})
+        fills = resp.get('fills', [])
+        if not fills:
+            return None, 0.0
+
+        total_value = 0.0
+        total_count = 0.0
+        total_fees = 0.0
+
+        for fill in fills:
+            count = float(fill.get('count_fp', 0))
+            if side == 'no':
+                price = float(fill.get('no_price_dollars', 0))
+            else:
+                price = float(fill.get('yes_price_dollars', 0))
+            total_value += price * count
+            total_count += count
+            total_fees += float(fill.get('fee_cost', 0))
+
+        if total_count > 0:
+            return total_value / total_count, total_fees
+        return None, 0.0
+    except Exception as e:
+        logger.warning(f"Failed to fetch fills for order {order_id}: {e}")
+        return None, 0.0
+
+
 def get_current_positions():
     """Get current open positions from Kalshi"""
     try:
@@ -93,6 +465,11 @@ def get_current_positions():
         # Filter to only positions with a non-zero holding (position_fp != "0.00")
         positions = [p for p in all_positions if float(p.get('position_fp', 0) or 0) != 0.0]
         logger.info(f"API returned {len(all_positions)} market positions, {len(positions)} with non-zero holdings")
+        if positions:
+            logger.info(f"Non-zero positions: {[p.get('ticker') for p in positions]}")
+        if not positions and all_positions:
+            zero_positions = [p.get('ticker', 'unknown') for p in all_positions if float(p.get('position_fp', 0) or 0) == 0.0]
+            logger.info(f"Zero holding positions: {zero_positions}")
         return positions
     except Exception as e:
         logger.error(f"Failed to get positions: {e}")
@@ -160,6 +537,42 @@ def calculate_seconds_to_close(close_time):
         return max(0.0, close_timestamp - current_timestamp)
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _parse_timestamp(val):
+    """Parse a Kalshi timestamp (ISO string, epoch int/float, or digit string) to epoch seconds."""
+    if val is None:
+        return None
+    try:
+        if isinstance(val, str):
+            val = val.strip()
+            if not val:
+                return None
+            if val.isdigit():
+                ts = float(val)
+            else:
+                parsed = datetime.fromisoformat(val.replace('Z', '+00:00'))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                ts = parsed.timestamp()
+        elif isinstance(val, (int, float)):
+            ts = float(val)
+        else:
+            return None
+        if ts > 100000000000:
+            ts /= 1000.0
+        return ts
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _compute_market_duration(open_time, close_time):
+    """Return total market duration in seconds, or None if unknown."""
+    ot = _parse_timestamp(open_time)
+    ct = _parse_timestamp(close_time)
+    if ot and ct and ct > ot:
+        return ct - ot
+    return None
 
 
 class QuoteEngine:
@@ -299,30 +712,44 @@ def get_market(ticker):
 
 
 def get_db_entry_for_ticker(cursor, ticker):
-    """Return latest open trade direction and entry price for ticker from local DB."""
+    """Return direction, volume-weighted average entry price, entry fees, and rows for ALL OPEN fills for ticker."""
     cursor.execute(
         """
-        SELECT direction, price
+        SELECT direction, price, size, COALESCE(fees, 0.0)
         FROM trades
         WHERE market_ticker = ? AND status = 'OPEN'
-        ORDER BY timestamp DESC, id DESC
-        LIMIT 1
+        ORDER BY timestamp ASC
         """,
         (ticker,),
     )
-    row = cursor.fetchone()
-    if not row:
-        return None, None
-    return row[0], float(row[1])
+    rows = cursor.fetchall()
+    if not rows:
+        return None, None, 0.0, []
+
+    direction = rows[0][0]  # all fills for a ticker should share the same direction
+    total_cost = 0.0
+    total_size = 0.0
+    total_fees = 0.0
+    for row in rows:
+        price = float(row[1])
+        size = float(row[2])
+        fees = float(row[3])
+        total_cost += price * size
+        total_size += size
+        total_fees += fees
+    avg_entry = total_cost / total_size if total_size > 0 else 0.0
+    return direction, avg_entry, total_fees, rows
 
 
 def derive_entry_from_position(position, api_direction):
     """Fallback entry estimate from Kalshi position payload when local DB has no row.
 
-    Uses total_traded_dollars / abs(position_fp) as an average contract cost for the
-    currently held side. This is less authoritative than the local execution log, but
-    it is far better than skipping risk management entirely for positions missing from
-    trades.db (for example manual trades or previously untracked fills).
+    Uses total_traded_dollars / abs(position_fp) as a rough average contract cost.
+    WARNING: total_traded_dollars is cumulative volume (buys + sells), so this
+    over-estimates the entry price if any partial sells occurred. We clamp the
+    result to the valid contract-price range [0.01, 0.99] to avoid nonsensical
+    values, and mark the source as 'api_position_cost_estimate' so callers know
+    this is an approximation.
     """
     raw_position = position.get("position_fp", 0)
     total_traded_dollars = position.get("total_traded_dollars", 0)
@@ -337,10 +764,19 @@ def derive_entry_from_position(position, api_direction):
         return None, None, None
 
     entry_price = total_cost / contracts
-    if entry_price <= 0:
-        return None, None, None
 
-    return api_direction, entry_price, "api_position_cost"
+    # Clamp to valid contract-price range
+    if entry_price > 0.99:
+        logger.warning(
+            f"Derived entry price {entry_price:.4f} exceeds $0.99 — "
+            f"total_traded_dollars ({total_cost}) likely includes sell volume. "
+            f"Clamping to $0.99."
+        )
+        entry_price = 0.99
+    elif entry_price < 0.01:
+        entry_price = 0.01
+
+    return api_direction, entry_price, "api_position_cost_estimate"
 
 
 def reconcile_open_position(cursor, ticker, direction, contracts, entry_price, entry_source):
@@ -377,6 +813,97 @@ def reconcile_open_position(cursor, ticker, direction, contracts, entry_price, e
     )
 
 
+def reconcile_db_vs_exchange(cursor, ticker, api_contracts, open_fills):
+    """Close stale OPEN rows in FIFO order when DB has more contracts than the exchange.
+
+    Args:
+        cursor: DB cursor
+        ticker: market ticker
+        api_contracts: actual contract count on the exchange (from position_fp)
+        open_fills: list of (direction, price, size) rows from get_db_entry_for_ticker,
+                    ordered by timestamp ASC
+    Returns:
+        Number of rows closed.
+    """
+    # Count DB contracts: each fill's size * 100 = contract count
+    db_contract_count = 0
+    for row in open_fills:
+        size = float(row[2])
+        db_contract_count += int(round(size * 100))
+
+    excess = db_contract_count - api_contracts
+    if excess <= 0:
+        return 0
+
+    logger.warning(
+        f"Reconciliation: {ticker} has {db_contract_count} OPEN contracts in DB "
+        f"but only {api_contracts} on exchange. Closing {excess} excess contracts (FIFO)."
+    )
+
+    # Close oldest fills first (rows are ASC by timestamp)
+    closed_count = 0
+    contracts_to_close = excess
+    for row in open_fills:
+        if contracts_to_close <= 0:
+            break
+        fill_price = float(row[1])
+        fill_size = float(row[2])
+        fill_contracts = int(round(fill_size * 100))
+
+        if fill_contracts <= contracts_to_close:
+            # Close entire fill
+            cursor.execute(
+                """
+                UPDATE trades SET status = 'CLOSED', reason = reason || ' | auto-reconciled',
+                    resolved_timestamp = datetime('now')
+                WHERE market_ticker = ? AND status = 'OPEN' AND price = ? AND size = ?
+                    AND id = (
+                        SELECT id FROM trades
+                        WHERE market_ticker = ? AND status = 'OPEN' AND price = ? AND size = ?
+                        ORDER BY timestamp ASC, id ASC LIMIT 1
+                    )
+                """,
+                (ticker, fill_price, fill_size, ticker, fill_price, fill_size),
+            )
+            contracts_to_close -= fill_contracts
+            closed_count += 1
+        else:
+            # Partial close: reduce the fill size, close the excess portion
+            remaining_size = (fill_contracts - contracts_to_close) / 100.0
+            cursor.execute(
+                """
+                UPDATE trades SET size = ?
+                WHERE market_ticker = ? AND status = 'OPEN' AND price = ? AND size = ?
+                    AND id = (
+                        SELECT id FROM trades
+                        WHERE market_ticker = ? AND status = 'OPEN' AND price = ? AND size = ?
+                        ORDER BY timestamp ASC, id ASC LIMIT 1
+                    )
+                """,
+                (remaining_size, ticker, fill_price, fill_size, ticker, fill_price, fill_size),
+            )
+            contracts_to_close = 0
+            closed_count += 1
+
+    return closed_count
+
+
+def mark_fills_closed(cursor, ticker, exit_price, trigger):
+    """Mark all OPEN fills for a ticker as CLOSED after a successful close order."""
+    cursor.execute(
+        """
+        UPDATE trades
+        SET status = 'CLOSED',
+            pnl = (? - price) * size,
+            reason = reason || ' | closed by ' || ?,
+            resolved_timestamp = datetime('now')
+        WHERE market_ticker = ? AND status = 'OPEN'
+        """,
+        (exit_price, trigger, ticker),
+    )
+    return cursor.rowcount
+
+
 def place_ioc_close_order(ticker, direction, count, executable_quote):
     """Send sell-to-close IOC order for YES/NO side."""
     side = "yes" if direction == "YES" else "no"
@@ -394,9 +921,9 @@ def place_ioc_close_order(ticker, direction, count, executable_quote):
     }
 
     if side == "yes":
-        order_body["yes_price"] = int(executable_quote["yes_bid_cents"])
+        order_body["yes_price"] = int(round(executable_quote["bid"] * 100))
     else:
-        order_body["no_price"] = int(executable_quote["no_bid_cents"])
+        order_body["no_price"] = int(round(executable_quote["bid"] * 100))
 
     return signed_request("POST", "/portfolio/orders", body=order_body), order_body
 
@@ -418,6 +945,8 @@ def notify_position_closed_async(
     pnl_percent,
     trigger,
     order_status,
+    entry_fees=0.0,
+    exit_fees=0.0,
 ):
     """Dispatch Discord notification on a daemon thread to keep monitor path non-blocking."""
     thread = threading.Thread(
@@ -432,6 +961,8 @@ def notify_position_closed_async(
             "pnl_percent": pnl_percent,
             "trigger": trigger,
             "order_status": order_status,
+            "entry_fees": entry_fees,
+            "exit_fees": exit_fees,
         },
         daemon=True,
     )
@@ -443,17 +974,64 @@ def monitor_positions_once():
     logger.info("Checking open positions for take-profit/stop-loss exits...")
 
     positions = get_current_positions()
-    if not positions:
-        logger.info("No open positions found")
-        return
 
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    # Load persisted trailing marks on first run
+    _load_trailing_marks_from_db(conn)
+
+    # --- Reconcile: close DB fills for tickers with zero exchange position ---
+    api_tickers = {p.get('ticker') for p in positions if p.get('ticker')} if positions else set()
+    cursor.execute("SELECT DISTINCT market_ticker FROM trades WHERE status = 'OPEN'")
+    db_open_tickers = {row[0] for row in cursor.fetchall()}
+    stale_tickers = db_open_tickers - api_tickers - RECONCILED_SETTLED_TICKERS
+    for stale_ticker in stale_tickers:
+        rows_closed = cursor.execute(
+            """
+            UPDATE trades
+            SET status = 'SETTLED',
+                reason = reason || ' | auto-settled (zero exchange position)',
+                resolved_timestamp = datetime('now')
+            WHERE market_ticker = ? AND status = 'OPEN'
+            """,
+            (stale_ticker,),
+        ).rowcount
+        if rows_closed:
+            logger.warning(
+                f"Reconciliation: {stale_ticker} has 0 contracts on exchange but {rows_closed} "
+                f"OPEN fill(s) in DB — marked as SETTLED."
+            )
+        RECONCILED_SETTLED_TICKERS.add(stale_ticker)
+    if stale_tickers:
+        conn.commit()
+
+    if not positions:
+        logger.warning("No open positions found or API failed. If this is unexpected, check API/WebSocket health.")
+        conn.close()
+        return
 
     logger.info(f"Processing {len(positions)} positions from API...")
     
     for position in positions:
         ticker = position.get('ticker')
+        # Dynamically subscribe to new tickers if needed
+        if ticker and WS_CLIENT and ticker not in WS_CLIENT.tickers:
+            try:
+                ws_loop = getattr(WS_CLIENT, '_loop', None)
+                if ws_loop and ws_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(WS_CLIENT.subscribe_ticker(ticker), ws_loop)
+                    logger.info(f"Requested dynamic WS subscription for {ticker}")
+                    # Brief wait for first snapshot (non-blocking feel: 2 x 250ms)
+                    for _ in range(2):
+                        if ticker in REALTIME_QUOTES:
+                            break
+                        time.sleep(0.25)
+                else:
+                    logger.debug(f"WS loop not available for dynamic subscription of {ticker}")
+            except Exception as e:
+                logger.debug(f"Failed to dynamically subscribe to {ticker}: {e}")
+
         # The API returns position_fp (fixed point format like "-78.00" for shorts)
         raw_position = position.get('position_fp', '0')
 
@@ -467,8 +1045,17 @@ def monitor_positions_once():
             continue
 
         api_direction = "YES" if float(raw_position) > 0 else "NO"
-        db_direction, entry_price = get_db_entry_for_ticker(cursor, ticker)
+        db_direction, entry_price, entry_fees, open_fills = get_db_entry_for_ticker(cursor, ticker)
         entry_source = "trades_db"
+
+        # Reconcile: if DB has more OPEN contracts than exchange, close excess FIFO
+        if open_fills:
+            closed = reconcile_db_vs_exchange(cursor, ticker, contracts, open_fills)
+            if closed > 0:
+                conn.commit()
+                # Re-fetch after reconciliation
+                db_direction, entry_price, entry_fees, open_fills = get_db_entry_for_ticker(cursor, ticker)
+
         if entry_price is None:
             fallback_direction, fallback_entry_price, fallback_source = derive_entry_from_position(position, api_direction)
             if fallback_entry_price is None:
@@ -476,6 +1063,7 @@ def monitor_positions_once():
                 continue
             db_direction = fallback_direction
             entry_price = fallback_entry_price
+            entry_fees = 0.0
             entry_source = fallback_source
             reconcile_open_position(cursor, ticker, db_direction, contracts, entry_price, entry_source)
             conn.commit()
@@ -486,47 +1074,76 @@ def monitor_positions_once():
 
         direction = db_direction if db_direction in {"YES", "NO"} else api_direction
         market = get_market(ticker)
-        snapshot, has_live_executable_quote = QUOTE_ENGINE.update(ticker, market, source="rest")
-        executable_quote, quote_reason, cached_snapshot = QUOTE_ENGINE.get_executable_quote(ticker, direction)
+        # Use real-time WebSocket quote
+        executable_quote, quote_reason = get_realtime_executable_quote(ticker, direction)
         hold_for_settlement, hold_reason = QUOTE_ENGINE.should_hold_for_settlement(ticker, market)
 
+        # Graceful degradation: never act on stale/missing data
         if executable_quote is None:
             if hold_for_settlement:
                 logger.info(f"Holding {ticker} for settlement: {hold_reason}")
             else:
-                logger.warning(
-                    f"Skipping {ticker}: no valid executable quote for {direction} "
-                    f"(reason={quote_reason}, live_quote={has_live_executable_quote})"
-                )
+                if quote_reason.startswith("stale"):
+                    logger.error(f"ALERT: Skipping {ticker} {direction} due to stale quote ({quote_reason}). WebSocket may be lagging or disconnected.")
+                else:
+                    logger.error(f"ALERT: Skipping {ticker} {direction} due to missing real-time quote ({quote_reason}). WebSocket/API may be down.")
             continue
 
         if hold_for_settlement:
             logger.info(
                 f"Holding {ticker}: settlement-aware gate active ({hold_reason}) "
-                f"with fresh_quote_source={cached_snapshot.get('source') if cached_snapshot else 'none'}"
+                f"with fresh_quote_source=websocket"
             )
             continue
 
-        current_price = (
-            executable_quote["yes_bid_dollars"] if direction == "YES" else executable_quote["no_bid_dollars"]
+
+        current_price = executable_quote["bid"]
+
+        # Compute per-contract fee (entry + estimated exit)
+        # Estimate exit fee ≈ entry fee per contract (same Kalshi rate applies both sides)
+        entry_fee_per_contract = (entry_fees / contracts) if contracts > 0 else 0.0
+        est_exit_fee_per_contract = entry_fee_per_contract  # same rate
+        fee_per_contract = entry_fee_per_contract + est_exit_fee_per_contract
+
+        unrealized_pnl = contracts * (current_price - entry_price) - entry_fees - (est_exit_fee_per_contract * contracts)
+        unrealized_pnl_pct = ((current_price - entry_price - fee_per_contract) / entry_price * 100.0) if entry_price > 0 else 0.0
+
+        # Compute time to close for smart exit
+        seconds_to_close = calculate_seconds_to_close(market.get("close_time"))
+
+        # Compute total market duration for proportional hold gate
+        market_duration_seconds = _compute_market_duration(market.get("open_time"), market.get("close_time"))
+
+        # Update trailing high/low water mark
+        update_trailing_mark(ticker, current_price, direction, conn=conn)
+
+        # Smart exit decision
+        should_exit, trigger, exit_reason = compute_smart_exit(
+            entry_price, current_price, direction, seconds_to_close, market_duration_seconds,
+            fee_per_contract=fee_per_contract
         )
 
-        unrealized_pnl = contracts * (current_price - entry_price)
-        unrealized_pnl_pct = ((current_price - entry_price) / entry_price * 100.0) if entry_price > 0 else 0.0
+        # Check trailing take-profit if smart exit didn't trigger
+        if not should_exit:
+            should_exit, trailing_reason = check_trailing_take_profit(ticker, entry_price, current_price, direction, fee_per_contract=fee_per_contract)
+            if should_exit:
+                trigger = "take_profit"
+                exit_reason = trailing_reason
+
+        ttc_str = f"{seconds_to_close:.0f}s" if seconds_to_close is not None else "unknown"
+        trail_str = f"${TRAILING_HIGH.get(ticker, 0):.3f}" if direction == "YES" else f"${TRAILING_LOW.get(ticker, float('inf')):.3f}"
 
         logger.info(
             f"{ticker} | dir={direction} | contracts={contracts} | entry={entry_price:.3f} | "
             f"entry_source={entry_source} | mark={current_price:.3f} | quote_source={executable_quote['source']} | "
-            f"unrealized_pnl=${unrealized_pnl:.2f} | pnl_pct={unrealized_pnl_pct:.2f}%"
+            f"unrealized_pnl=${unrealized_pnl:.2f} | pnl_pct={unrealized_pnl_pct:.2f}% | "
+            f"ttc={ttc_str} | trail={trail_str} | exit={'YES:'+trigger if should_exit else 'NO'}"
         )
 
-        should_take_profit = unrealized_pnl_pct >= TAKE_PROFIT_PERCENT
-        should_stop_loss = unrealized_pnl_pct <= STOP_LOSS_PERCENT
-
-        if not should_take_profit and not should_stop_loss:
+        if not should_exit:
+            if exit_reason:
+                logger.debug(f"{ticker}: {exit_reason}")
             continue
-
-        trigger = "take_profit" if should_take_profit else "stop_loss"
         close_key = f"{ticker}:{direction}"
         now_ts = time.time()
         pending_until = PENDING_CLOSE_UNTIL.get(close_key, 0.0)
@@ -538,30 +1155,69 @@ def monitor_positions_once():
 
         logger.warning(
             f"Exit trigger hit for {ticker}: {trigger} | pnl=${unrealized_pnl:.2f} | pnl_pct={unrealized_pnl_pct:.2f}% | "
-            f"thresholds_pct=({TAKE_PROFIT_PERCENT:.2f}%/{STOP_LOSS_PERCENT:.2f}%)"
+            f"reason={exit_reason}"
         )
 
+
         try:
+            # Atomic close: fetch a fresh real-time quote before submitting close order
+            fresh_quote, fresh_reason = get_realtime_executable_quote(ticker, direction)
+            if not fresh_quote:
+                logger.error(f"Atomic close failed: no fresh quote for {ticker} {direction} (reason={fresh_reason})")
+                PENDING_CLOSE_UNTIL.pop(close_key, None)
+                continue
             PENDING_CLOSE_UNTIL[close_key] = now_ts + POSITION_CLOSE_COOLDOWN_SECONDS
-            response, order_body = place_ioc_close_order(ticker, direction, contracts, executable_quote)
+            response, order_body = place_ioc_close_order(ticker, direction, contracts, fresh_quote)
             order_data = response.get("order", {}) if isinstance(response, dict) else {}
             order_status = order_data.get("status") or response.get("status") if isinstance(response, dict) else None
+
+            # Fetch actual fill price and fees from exchange
+            sell_side = "yes" if direction == "YES" else "no"
+            kalshi_order_id = order_data.get('order_id')
+            actual_exit_price, exit_fees = fetch_fill_price_and_fees(kalshi_order_id, sell_side) if kalshi_order_id else (None, 0.0)
+
+            if actual_exit_price is not None:
+                exit_price = actual_exit_price
+                logger.info(f"Actual exit fill price for {ticker}: ${exit_price:.4f} (fees: ${exit_fees:.2f})")
+            else:
+                exit_price = fresh_quote["bid"]
+                exit_fees = 0.0
+                logger.warning(f"Could not fetch exit fills for {ticker}, using quote price ${exit_price:.4f}")
+
+            realized_pnl = contracts * (exit_price - entry_price) - entry_fees - exit_fees
+            realized_pnl_pct = ((exit_price - entry_price) / entry_price * 100.0) if entry_price > 0 else 0.0
 
             logger.success(
                 f"Close order sent | ticker={ticker} | trigger={trigger} | body={json.dumps(order_body)} | "
                 f"response={json.dumps(response)}"
             )
 
+            # Mark all OPEN fills in DB as CLOSED with realized P&L
+            rows_closed = mark_fills_closed(cursor, ticker, exit_price, trigger)
+            conn.commit()
+            logger.info(f"Marked {rows_closed} OPEN fill(s) as CLOSED for {ticker} at exit={exit_price:.4f}")
+
+            # Clean trailing marks for closed position
+            TRAILING_HIGH.pop(ticker, None)
+            TRAILING_LOW.pop(ticker, None)
+            _delete_trailing_mark(conn, ticker)
+
+            # Alert if loss exceeds -20% (severe loss on binary contract)
+            if trigger == "stop_loss" and realized_pnl_pct < -20.0:
+                logger.error(f"ALERT: Close order for {ticker} executed with severe loss {realized_pnl_pct:.2f}%")
+
             notify_position_closed_async(
                 ticker=ticker,
                 direction=direction,
                 quantity=contracts,
                 entry_price=entry_price,
-                exit_price=current_price,
-                pnl_dollars=unrealized_pnl,
-                pnl_percent=unrealized_pnl_pct,
+                exit_price=exit_price,
+                pnl_dollars=realized_pnl,
+                pnl_percent=realized_pnl_pct,
                 trigger=trigger,
                 order_status=order_status,
+                entry_fees=entry_fees,
+                exit_fees=exit_fees,
             )
         except Exception as close_err:
             # Allow immediate retry next loop if the close request itself failed.
@@ -578,8 +1234,8 @@ def monitor_positions_once():
 def monitor_positions():
     """Run the exit monitor loop continuously."""
     logger.info(
-        f"Starting position monitor loop | take_profit={TAKE_PROFIT_PERCENT:.2f}% | "
-        f"stop_loss={STOP_LOSS_PERCENT:.2f}% | interval={MONITOR_INTERVAL_SECONDS}s | "
+        f"Starting position monitor loop | exit_strategy=smart_binary | "
+        f"interval={MONITOR_INTERVAL_SECONDS}s | "
         f"hold_for_settlement={SETTLEMENT_HOLD_ENABLED} | settlement_window={SETTLEMENT_HOLD_SECONDS}s"
     )
     while True:
@@ -590,4 +1246,14 @@ def monitor_positions():
         time.sleep(MONITOR_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
+    # Fetch all tickers to monitor (from open positions at startup)
+    try:
+        initial_positions = get_current_positions()
+        tickers = [p.get('ticker') for p in initial_positions if p.get('ticker')]
+        if tickers:
+            start_ws_client(tickers)
+        else:
+            logger.warning("No tickers found to subscribe to WebSocket at startup.")
+    except Exception as e:
+        logger.error(f"Failed to fetch initial tickers for WebSocket: {e}")
     monitor_positions()

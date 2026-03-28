@@ -17,3 +17,4 @@ streamlit
 textblob
 winsound
 xai_sdk
+websockets

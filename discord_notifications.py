@@ -36,12 +36,12 @@ def get_rolling_24h_performance(db_path: str = "trades.db") -> dict:
         cursor.execute(
             f"""
             SELECT
-                COALESCE(SUM(CASE WHEN status = 'WON' THEN 1 ELSE 0 END), 0) AS wins,
-                COALESCE(SUM(CASE WHEN status = 'LOST' THEN 1 ELSE 0 END), 0) AS losses,
-                COALESCE(SUM(CASE WHEN status IN ('WON', 'LOST') THEN pnl ELSE 0 END), 0.0) AS pnl_total,
-                COALESCE(SUM(CASE WHEN status IN ('WON', 'LOST') THEN size * price ELSE 0 END), 0.0) AS total_cost
+                COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
+                COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) AS losses,
+                COALESCE(SUM(pnl), 0.0) AS pnl_total,
+                COALESCE(SUM(size * price), 0.0) AS total_cost
             FROM trades
-            WHERE status IN ('WON', 'LOST')
+            WHERE status IN ('WON', 'LOST', 'CLOSED', 'SETTLED')
               AND COALESCE({time_field}, timestamp) >= datetime('now', '-24 hours')
             """
         )
@@ -84,12 +84,12 @@ def get_all_time_performance(db_path: str = "trades.db") -> dict:
         cursor.execute(
             """
             SELECT
-                COALESCE(SUM(CASE WHEN status = 'WON' THEN 1 ELSE 0 END), 0) AS wins,
-                COALESCE(SUM(CASE WHEN status = 'LOST' THEN 1 ELSE 0 END), 0) AS losses,
-                COALESCE(SUM(CASE WHEN status IN ('WON', 'LOST') THEN pnl ELSE 0 END), 0.0) AS pnl_total,
-                COALESCE(SUM(CASE WHEN status IN ('WON', 'LOST') THEN size * price ELSE 0 END), 0.0) AS total_cost
+                COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
+                COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) AS losses,
+                COALESCE(SUM(pnl), 0.0) AS pnl_total,
+                COALESCE(SUM(size * price), 0.0) AS total_cost
             FROM trades
-            WHERE status IN ('WON', 'LOST')
+            WHERE status IN ('WON', 'LOST', 'CLOSED', 'SETTLED')
             """
         )
         wins, losses, pnl_total, total_cost = cursor.fetchone()
@@ -231,6 +231,7 @@ def notify_trade_executed(
     total_cost: float,
     is_undervalued: bool = False,
     order_status: str = None,
+    fees: float = 0.0,
 ):
     """Send notification when a trade is executed."""
     message = f"🚀 **Trade Executed!**"
@@ -242,17 +243,16 @@ def notify_trade_executed(
     if order_status:
         fields.append({"name": "Exchange Status", "value": order_status, "inline": False})
 
+    total_with_fees = total_cost + fees
+
     embed_data = {
         "title": "New Trade",
         "description": (
-            f"Event Title: {market_title}\n"
-            f"Market: {ticker}\n"
-            f"Direction: {direction}\n"
-            f"Confidence: {confidence}%\n"
-            f"Quantity: {quantity}\n"
-            f"Price: ${price:.2f}\n"
-            f"Total Cost: ${total_cost:.2f}\n"
-            f"Undervalued: {'Yes' if is_undervalued else 'No'}"
+            f"**Event:** {market_title}\n"
+            f"**Market:** {ticker}\n"
+            f"**Direction:** {direction}\n"
+            f"**Confidence:** {confidence}%\n\n"
+            f"**Bought:** {quantity} × ${price:.4f} = **${total_with_fees:.2f}**"
         ),
         "color": 3066993,  # Green
         "fields": fields
@@ -270,10 +270,17 @@ def notify_position_closed(
     pnl_percent: float,
     trigger: str,
     order_status: str | None = None,
+    entry_fees: float = 0.0,
+    exit_fees: float = 0.0,
 ):
     """Send notification when a position close order is submitted."""
     message = "📉 **Position Closed**"
     trigger_label = "Take Profit" if trigger == "take_profit" else "Stop Loss"
+
+    total_cost = entry_price * quantity + entry_fees
+    total_exit = exit_price * quantity - exit_fees
+    net_pnl = total_exit - total_cost
+
     fields = [
         {"name": "Trigger", "value": trigger_label, "inline": True},
     ]
@@ -284,33 +291,64 @@ def notify_position_closed(
     embed_data = {
         "title": "Exit Order Submitted",
         "description": (
-            f"Market: {ticker}\n"
-            f"Direction: {direction}\n"
-            f"Quantity: {quantity}\n"
-            f"Entry Price: ${entry_price:.3f}\n"
-            f"Exit Price: ${exit_price:.3f}\n"
-            f"P&L: ${pnl_dollars:.2f}\n"
-            f"P&L %: {pnl_percent:.2f}%"
+            f"**Market:** {ticker}\n"
+            f"**Direction:** {direction}\n"
+            f"**Quantity:** {quantity}\n\n"
+            f"**Bought:** ${total_cost:.2f}\n"
+            f"**Sold:** ${total_exit:.2f}\n\n"
+            f"**P&L:** ${net_pnl:+.2f}"
         ),
-        "color": 3066993 if pnl_dollars >= 0 else 15158332,
+        "color": 3066993 if net_pnl >= 0 else 15158332,
         "fields": fields,
     }
     send_discord_notification(message, embed_data)
 
-def notify_cycle_summary(total_markets: int, considered: int, trades: int, pnl_today: float, total_order_cost: float):
-    """Send daily cycle summary."""
-    message = f"📊 **Cycle Summary**"
+def notify_cycle_summary(total_markets: int, considered: int, trades: int, pnl_today: float, total_order_cost: float,
+                         balance: float = None, portfolio_value: float = None):
+    """Send a single consolidated cycle summary with optional balance and 24h performance."""
+    fields = []
+
+    # Account balance section (if provided)
+    if balance is not None and portfolio_value is not None:
+        total_value = balance + portfolio_value
+        fields.append({
+            "name": "💰 Account",
+            "value": f"Cash: ${balance:.2f} | Portfolio: ${portfolio_value:.2f} | Total: ${total_value:.2f}",
+            "inline": False,
+        })
+
+    # Rolling 24h performance (if enabled)
+    if DISCORD_INCLUDE_ROLLING24H:
+        perf = get_rolling_24h_performance()
+        if perf["resolved"] > 0:
+            pnl_emoji = "📈" if perf["pnl"] >= 0 else "📉"
+            fields.append({
+                "name": f"{pnl_emoji} Rolling 24h",
+                "value": f"W/L: {perf['wins']}/{perf['losses']} | P&L: ${perf['pnl']:.2f} ({perf['pnl_pct']:+.1f}%)",
+                "inline": False,
+            })
+
+    # All-time performance (if enabled)
+    if DISCORD_INCLUDE_ALL_TIME_PERFORMANCE:
+        perf_at = get_all_time_performance()
+        if perf_at["resolved"] > 0:
+            fields.append({
+                "name": "🧾 All-Time",
+                "value": f"W/L: {perf_at['wins']}/{perf_at['losses']} | P&L: ${perf_at['pnl']:.2f} ({perf_at['pnl_pct']:+.1f}%)",
+                "inline": False,
+            })
+
+    message = f"📊 **Cycle Complete** — {trades} trade{'s' if trades != 1 else ''} | {considered}/{total_markets} markets"
     embed_data = {
-        "title": "Market Scan Complete",
+        "title": "Cycle Summary",
         "description": (
-            f"Total Markets: {total_markets}\n"
+            f"Markets Scanned: {total_markets}\n"
             f"Considered: {considered}\n"
             f"Trades: {trades}\n"
-            f"Total Order Cost: ${total_order_cost:.2f}\n"
-            f"PnL Today: ${pnl_today:.2f}"
+            f"Cycle Cost: ${total_order_cost:.2f}"
         ),
-        "color": 16776960 if pnl_today >= 0 else 15158332,  # Yellow if positive, red if negative
-        "fields": []
+        "color": 3066993 if trades > 0 else 3447003,
+        "fields": fields,
     }
     send_discord_notification(message, embed_data)
 

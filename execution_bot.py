@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from config import *
 from decision_engine import should_trade
-from discord_notifications import notify_trade_executed, notify_error, notify_startup, notify_cycle_summary, notify_account_balance, notify_rolling_24h_performance, notify_all_time_performance
+from discord_notifications import notify_trade_executed, notify_error, notify_startup, notify_cycle_summary, notify_account_balance
 import winsound
 
 setup_log_file("bot.log")
@@ -139,6 +139,7 @@ def ensure_trade_table_columns():
         'kalshi_order_id': 'TEXT',
         'order_status': 'TEXT',
         'resolved_timestamp': 'TEXT',
+        'fees': 'REAL DEFAULT 0',
     }
 
     for column_name, column_type in required_columns.items():
@@ -169,6 +170,39 @@ def play_trade_notification():
         logger.info("Audio played")
     except Exception as e:
         logger.warning(f"Audio failed: {e}")
+
+def fetch_fill_price_and_fees(order_id, side):
+    """Fetch actual fill price and fees from Kalshi fills endpoint.
+
+    Returns (avg_fill_price, total_fees) or (None, 0.0) on failure.
+    """
+    try:
+        resp = signed_request('GET', '/portfolio/fills', params={'order_id': order_id})
+        fills = resp.get('fills', [])
+        if not fills:
+            return None, 0.0
+
+        total_value = 0.0
+        total_count = 0.0
+        total_fees = 0.0
+
+        for fill in fills:
+            count = float(fill.get('count_fp', 0))
+            if side == 'no':
+                price = float(fill.get('no_price_dollars', 0))
+            else:
+                price = float(fill.get('yes_price_dollars', 0))
+            total_value += price * count
+            total_count += count
+            total_fees += float(fill.get('fee_cost', 0))
+
+        if total_count > 0:
+            return total_value / total_count, total_fees
+        return None, 0.0
+    except Exception as e:
+        logger.warning(f"Failed to fetch fills for order {order_id}: {e}")
+        return None, 0.0
+
 
 def extract_order_metadata(order_response):
     if not isinstance(order_response, dict):
@@ -334,19 +368,23 @@ def update_resolved_trades():
                 f"settled_time={settlement.get('settled_time')}"
             )
             
-            # Get all open trades for this ticker
+            # Get all open/pending trades for this ticker (OPEN, CLOSED by monitor, or SETTLED by reconciliation)
             cursor = conn.cursor()
-            cursor.execute("SELECT id, direction, size FROM trades WHERE market_ticker = ? AND status = 'OPEN'", (ticker,))
+            cursor.execute(
+                "SELECT id, direction, size, status FROM trades WHERE market_ticker = ? AND status IN ('OPEN', 'CLOSED', 'SETTLED')",
+                (ticker,),
+            )
             open_trades = cursor.fetchall()
             
-            for trade_id, direction, size in open_trades:
+            for trade_id, direction, size, current_status in open_trades:
                 if direction == winner:
                     pnl = size
                     status = 'WON'
                 else:
                     pnl = -size
                     status = 'LOST'
-                    daily_loss += size  # Accumulate loss
+                    if current_status == 'OPEN':
+                        daily_loss += size  # Only accumulate loss for positions not already exited
                 
                 # Update the trade
                 cursor.execute(
@@ -419,7 +457,6 @@ def log_account_balance():
         logger.info(
             f"Account balance | cash: ${balance:.2f} | portfolio: ${portfolio_value:.2f} | total: ${total_value:.2f}"
         )
-        notify_account_balance(balance, portfolio_value, total_value)
     except Exception as balance_err:
         logger.error(f"Balance check failed: {balance_err}")
 
@@ -779,11 +816,26 @@ def main_loop():
                     if not actually_filled:
                         logger.warning(f"IOC order for {ticker} was NOT filled (status={order_status}). Skipping DB insert.")
                     else:
+                        # Fetch actual fill price and fees from exchange
+                        actual_price, entry_fees = fetch_fill_price_and_fees(kalshi_order_id, side)
+                        if actual_price is not None:
+                            if abs(actual_price - contract_price) > 0.001:
+                                logger.info(
+                                    f"Fill price differs from limit: submitted ${contract_price:.4f} → "
+                                    f"filled ${actual_price:.4f} (improvement: ${contract_price - actual_price:+.4f})"
+                                )
+                            contract_price = actual_price
+                            total_order_cost = count * contract_price
+                        else:
+                            entry_fees = 0.0
+                            logger.warning(f"Could not fetch fills for {ticker}, using limit price ${contract_price:.4f}")
+
                         trade_msg = (
                             f"TRADE PLACED: {decision['direction']} on {ticker}\n"
                             f"Quantity: {count}\n"
-                            f"Price: ${contract_price:.2f}\n"
+                            f"Price: ${contract_price:.4f}\n"
                             f"Total Cost: ${total_order_cost:.2f}\n"
+                            f"Fees: ${entry_fees:.2f}\n"
                             f"Reason: {decision['reason']}\n"
                             f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
                         )
@@ -804,6 +856,7 @@ def main_loop():
                             total_order_cost,
                             is_undervalued=decision.get('is_undervalued', False),
                             order_status=order_status,
+                            fees=entry_fees,
                         )
 
                         update_trade_status(ticker, 'OPEN')
@@ -821,9 +874,10 @@ def main_loop():
                                 status,
                                 client_order_id,
                                 kalshi_order_id,
-                                order_status
+                                order_status,
+                                fees
                             )
-                            VALUES (datetime('now'), ?, ?, ?, ?, 0.0, ?, 'OPEN', ?, ?, ?)
+                            VALUES (datetime('now'), ?, ?, ?, ?, 0.0, ?, 'OPEN', ?, ?, ?, ?)
                         ''', (
                             ticker,
                             decision['direction'],
@@ -833,6 +887,7 @@ def main_loop():
                             client_order_id,
                             kalshi_order_id,
                             order_status,
+                            entry_fees,
                         ))
                         conn.commit()
 
@@ -858,15 +913,22 @@ def main_loop():
 
         update_resolved_trades()
 
-        # Send standalone rolling 24h performance as its own Discord section/message.
-        notify_rolling_24h_performance()
-        notify_all_time_performance()
-
         logger.info(f"Cycle summary | expiring ({MARKET_SCAN_HOURS}h): {total} | considered: {considered} | trades: {decided_to_trade}")
 
-        # Send Discord cycle summary
-        pnl_today = 0.0  # You might want to calculate this from the database
-        notify_cycle_summary(total, considered, decided_to_trade, pnl_today, cycle_total_order_cost)
+        # Single consolidated Discord notification — only when trades were made
+        if decided_to_trade > 0:
+            cycle_balance = None
+            cycle_portfolio = None
+            try:
+                bal_data = signed_request("GET", "/portfolio/balance")
+                cycle_balance = bal_data.get('balance', 0) / 100
+                cycle_portfolio = bal_data.get('portfolio_value', 0) / 100
+            except Exception:
+                pass
+
+            pnl_today = 0.0
+            notify_cycle_summary(total, considered, decided_to_trade, pnl_today, cycle_total_order_cost,
+                                 balance=cycle_balance, portfolio_value=cycle_portfolio)
 
     except Exception as e:
         logger.error(f"Main loop error: {e}")
