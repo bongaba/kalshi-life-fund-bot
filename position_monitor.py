@@ -170,13 +170,14 @@ def compute_smart_exit(entry_price, current_price, direction, seconds_to_close, 
     Binary contracts settle at $1.00 (win) or $0.00 (lose).
     Returns (should_exit, trigger, reason) tuple.
 
-    All thresholds are dollar-based, proportional to max_payout:
-      max_payout = contracts * (1.0 - entry_price) - total_fees
-    This ensures risk/reward is always balanced regardless of entry price.
+    3-Tier Stop-Loss System:
+      Tier | Entry Range   | Rule                    | Price Drop to Trigger
+      -----+---------------+-------------------------+----------------------
+        1  | >= $0.82      | Absolute 15¢ below entry| 15¢/contract
+        2  | $0.75 – $0.81 | 25% of max_payout       | ~5-6¢/contract
+        3  | < $0.75       | 15% of max_payout       | Tight protection
 
-    Strategy:
-      1. Stop-loss: exit if unrealized_pnl <= -(max_payout * SL_PCT)
-      2. Trailing take-profit: ratcheting floor (handled separately)
+    Trailing take-profit is handled separately by check_trailing_take_profit().
     """
     # --- Max payout: total possible profit if contract settles at $1.00 ---
     total_fees = fee_per_contract * contracts
@@ -187,35 +188,48 @@ def compute_smart_exit(entry_price, current_price, direction, seconds_to_close, 
     # so profit = current - entry for both directions.
     unrealized_pnl = contracts * (current_price - entry_price) - total_fees
 
-    # --- High-confidence positions: use absolute price floor instead of max-payout stop ---
-    # At 90¢+ entry, max_payout is tiny so percentage-based stops fire on normal bid noise.
-    # Instead, only stop-loss if price drops significantly below entry (genuine reversal).
-    HIGH_CONFIDENCE_THRESHOLD = 0.90
-    HIGH_CONFIDENCE_STOP_DROP = 0.15  # exit if price drops 15¢+ below entry
-    if entry_price >= HIGH_CONFIDENCE_THRESHOLD:
+    # --- 3-tier stop-loss system ---
+    # Tier 1 (≥$0.82): absolute 15¢ floor — high confidence, max noise protection
+    # Tier 2 ($0.75–$0.81): 25% of max_payout — moderate breathing room
+    # Tier 3 (<$0.75): 15% of max_payout — tight protection for higher risk entries
+    TIER1_THRESHOLD = 0.82
+    TIER2_THRESHOLD = 0.75
+    TIER1_STOP_DROP = 0.15  # absolute 15¢ drop from entry
+
+    if entry_price >= TIER1_THRESHOLD:
+        # Tier 1: absolute price floor
         price_drop = entry_price - current_price
-        if price_drop >= HIGH_CONFIDENCE_STOP_DROP:
+        if price_drop >= TIER1_STOP_DROP:
             return True, "stop_loss", (
-                f"high-confidence stop: price dropped ${price_drop:.3f}/contract "
-                f"(threshold=${HIGH_CONFIDENCE_STOP_DROP:.2f}) from entry=${entry_price:.3f} "
+                f"tier1 stop: price dropped ${price_drop:.3f}/contract "
+                f"(threshold=${TIER1_STOP_DROP:.2f}) from entry=${entry_price:.3f} "
                 f"to bid=${current_price:.3f}"
             )
         return False, None, None
 
-    # --- Stop-loss: cap loss as % of max_payout ---
-    SL_PCT = 0.15  # lose at most 15% of what you could have won
-    MIN_STOP_DISTANCE = 0.02  # minimum $0.02/contract price drop before stop
-    sl_dollar = max_payout * SL_PCT
-    # Enforce minimum stop distance so tiny max-profit positions aren't stopped by noise
-    sl_dollar = max(sl_dollar, contracts * MIN_STOP_DISTANCE)
+    elif entry_price >= TIER2_THRESHOLD:
+        # Tier 2: 25% of max_payout
+        SL_PCT = 0.25
+        MIN_STOP_DISTANCE = 0.02
+        sl_dollar = max(max_payout * SL_PCT, contracts * MIN_STOP_DISTANCE)
+        if unrealized_pnl <= -sl_dollar:
+            return True, "stop_loss", (
+                f"tier2 pnl ${unrealized_pnl:.2f} breached stop -${sl_dollar:.2f} "
+                f"(max_payout=${max_payout:.2f}, sl={SL_PCT:.0%})"
+            )
+        return False, None, None
 
-    if unrealized_pnl <= -sl_dollar:
-        return True, "stop_loss", (
-            f"pnl ${unrealized_pnl:.2f} breached stop -${sl_dollar:.2f} "
-            f"(max_payout=${max_payout:.2f}, sl={SL_PCT:.0%})"
-        )
-
-    return False, None, None
+    else:
+        # Tier 3: 15% of max_payout
+        SL_PCT = 0.15
+        MIN_STOP_DISTANCE = 0.02
+        sl_dollar = max(max_payout * SL_PCT, contracts * MIN_STOP_DISTANCE)
+        if unrealized_pnl <= -sl_dollar:
+            return True, "stop_loss", (
+                f"tier3 pnl ${unrealized_pnl:.2f} breached stop -${sl_dollar:.2f} "
+                f"(max_payout=${max_payout:.2f}, sl={SL_PCT:.0%})"
+            )
+        return False, None, None
 
 
 def update_trailing_mark(ticker, current_price, direction="YES", conn=None):
@@ -1134,11 +1148,16 @@ def monitor_positions_once():
         # Stop-loss confirmation: require N consecutive breaches to filter volatility
         # BUT: skip confirmations for severe breaches (2x+ threshold) — exit immediately
         if should_exit and trigger == "stop_loss":
-            # Parse the unrealized PnL and SL threshold from the exit reason to check severity
+            # Compute the effective SL threshold for this tier to check severity
             total_fees = fee_per_contract * contracts
             max_payout = max(0.01, contracts * (1.0 - entry_price) - total_fees)
             unrealized_pnl = contracts * (current_price - entry_price) - total_fees
-            sl_dollar = max(max_payout * 0.15, contracts * 0.02)
+            if entry_price >= 0.82:
+                sl_dollar = contracts * 0.15  # tier1: absolute 15¢
+            elif entry_price >= 0.75:
+                sl_dollar = max(max_payout * 0.25, contracts * 0.02)  # tier2: 25%
+            else:
+                sl_dollar = max(max_payout * 0.15, contracts * 0.02)  # tier3: 15%
             severe_breach = unrealized_pnl <= -(sl_dollar * 2)  # loss is 2x+ the threshold
 
             if severe_breach:
