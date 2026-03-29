@@ -1,6 +1,7 @@
 from pathlib import Path
 import shutil
 import os
+from datetime import datetime
 
 from loguru import logger
 
@@ -75,7 +76,8 @@ def setup_log_file(filename: str, rotation: str = "1 day") -> Path:
     archived_files, skipped_files = _move_legacy_root_logs(filename)
     family_dir = _get_log_family_dir(filename)
     base_name = Path(filename)
-    process_safe_name = f"{base_name.stem}.{os.getpid()}{base_name.suffix}"
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    process_safe_name = f"{base_name.stem}.{timestamp}_pid{os.getpid()}{base_name.suffix}"
     log_path = family_dir / process_safe_name
 
     if log_path not in _CONFIGURED_LOG_FILES:
