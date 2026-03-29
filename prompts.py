@@ -35,8 +35,9 @@ CRITICAL INSTRUCTIONS — FOLLOW EXACTLY AND IN THIS ORDER:
 4. You MUST also check current Bitcoin sentiment using x_keyword_search or x_semantic_search for posts from the last 1-minute.
 
 5. Pay very close attention to "Hours until close":
-   - < 10 minutes left → very heavy weight on current BRTI price + immediate momentum
-   - ≥ 10 minutes left → balance current price with short-term trend and catalysts
+   - < 30 minutes left → require strong consensus across BRTI + at least one other fresh source. Do NOT overweight a single stale BRTI reading.
+   - < 10 minutes left → extremely strict freshness (all sources < 3 min old). If any discrepancy > 0.5%, use the freshest non-BRTI source + immediate order flow momentum.
+   - ≥ 30 minutes left → balance BRTI with short-term trend and catalysts
 
 6. Analyze:
    - Current BRTI price vs any strike (if present) or current price direction

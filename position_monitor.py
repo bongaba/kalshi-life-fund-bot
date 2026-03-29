@@ -187,6 +187,21 @@ def compute_smart_exit(entry_price, current_price, direction, seconds_to_close, 
     # so profit = current - entry for both directions.
     unrealized_pnl = contracts * (current_price - entry_price) - total_fees
 
+    # --- High-confidence positions: use absolute price floor instead of max-payout stop ---
+    # At 90¢+ entry, max_payout is tiny so percentage-based stops fire on normal bid noise.
+    # Instead, only stop-loss if price drops significantly below entry (genuine reversal).
+    HIGH_CONFIDENCE_THRESHOLD = 0.90
+    HIGH_CONFIDENCE_STOP_DROP = 0.15  # exit if price drops 15¢+ below entry
+    if entry_price >= HIGH_CONFIDENCE_THRESHOLD:
+        price_drop = entry_price - current_price
+        if price_drop >= HIGH_CONFIDENCE_STOP_DROP:
+            return True, "stop_loss", (
+                f"high-confidence stop: price dropped ${price_drop:.3f}/contract "
+                f"(threshold=${HIGH_CONFIDENCE_STOP_DROP:.2f}) from entry=${entry_price:.3f} "
+                f"to bid=${current_price:.3f}"
+            )
+        return False, None, None
+
     # --- Stop-loss: cap loss as % of max_payout ---
     SL_PCT = 0.15  # lose at most 15% of what you could have won
     MIN_STOP_DISTANCE = 0.02  # minimum $0.02/contract price drop before stop
