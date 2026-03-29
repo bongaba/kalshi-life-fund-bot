@@ -19,6 +19,10 @@ FALSY_VALUES = {"0", "false", "no", "off"}
 
 def get_required_env(name: str) -> str:
 	value = os.getenv(name)
+	if value is None:
+		raise ValueError(f"Missing required environment variable: {name}")
+	return value.strip()
+
 
 def get_optional_env(name: str) -> str | None:
 	value = os.getenv(name)
