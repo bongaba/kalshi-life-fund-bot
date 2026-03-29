@@ -1,5 +1,4 @@
 from grok_analyzer import get_grok_decision
-from gemini_analyzer import get_gemini_decision
 from config import *
 from loguru import logger
 from concurrent.futures import ThreadPoolExecutor
@@ -168,16 +167,14 @@ def analyze_market_with_validators(
     internal_direction: str,
 ) -> tuple[dict | None, dict | None]:
     logger.info(
-        f"[DECISION_ENGINE] Validation starting | internal_decision={internal_direction} | use_grok={USE_GROK} | use_gemini={USE_GEMINI}"
+        f"[DECISION_ENGINE] Validation starting | internal_decision={internal_direction} | use_grok={USE_GROK}"
     )
 
-    if not USE_GROK and not USE_GEMINI:
+    if not USE_GROK:
         return None, None
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=1) as executor:
         grok_future = None
-        gemini_future = None
-
         if USE_GROK:
             grok_future = executor.submit(
                 get_grok_decision,
@@ -188,23 +185,8 @@ def analyze_market_with_validators(
                 volume,
                 hours_to_close,
             )
-
-        if USE_GEMINI:
-            gemini_future = executor.submit(
-                get_gemini_decision,
-                market_title,
-                yes_price,
-                no_price,
-                description,
-                volume,
-                hours_to_close,
-                internal_direction,
-            )
-
         grok_result = grok_future.result() if grok_future is not None else None
-        gemini_result = gemini_future.result() if gemini_future is not None else None
-
-    return gemini_result, grok_result
+    return None, grok_result
 
 def should_trade(market: dict) -> dict | None:
     yes_price = market.get('yes_price')
@@ -279,7 +261,7 @@ def should_trade(market: dict) -> dict | None:
         f"[DECISION_ENGINE] External validation starting | ticker={market.get('ticker', 'UNKNOWN')} | "
         f"internal_decision={internal_decision} | undervalued={internal_result['is_undervalued']}"
     )
-    gemini, grok = analyze_market_with_validators(
+    _, grok = analyze_market_with_validators(
         market['title'],
         yes_price,
         no_price,
@@ -289,11 +271,6 @@ def should_trade(market: dict) -> dict | None:
         internal_decision,
     )
 
-    gemini_summary = (
-        f"{gemini['direction']}({gemini['confidence']})"
-        if gemini is not None
-        else "DISABLED"
-    )
     grok_summary = (
         f"{grok['direction']}({grok['confidence']})"
         if grok is not None
@@ -303,57 +280,48 @@ def should_trade(market: dict) -> dict | None:
     logger.info(
         f"[DECISION_ENGINE] Validator results | ticker={market.get('ticker', 'UNKNOWN')} | "
         f"internal={internal_decision} | undervalued={internal_result['is_undervalued']} | "
-        f"gemini={gemini_summary} | grok={grok_summary}"
+        f"grok={grok_summary}"
     )
 
-    active_results = []
-    if USE_GEMINI and gemini is not None:
-        active_results.append(("Gemini", gemini))
     if USE_GROK and grok is not None:
-        active_results.append(("Grok", grok))
-
-    if not active_results:
-        logger.info(
-            f"[DECISION_ENGINE] Rejected after validation | ticker={market.get('ticker', 'UNKNOWN')} | no external validators enabled"
-        )
-        return None
-
-    for validator_name, validator_result in active_results:
         rejection_reasons = []
-        if validator_result['direction'] != internal_decision:
-            rejection_reasons.append(f"direction_mismatch(expected={internal_decision}, got={validator_result['direction']})")
-        if validator_result['direction'] == 'HOLD':
+        if grok['direction'] != internal_decision:
+            rejection_reasons.append(f"direction_mismatch(expected={internal_decision}, got={grok['direction']})")
+        if grok['direction'] == 'HOLD':
             rejection_reasons.append("validator_hold")
-        if validator_result['confidence'] < ANALYZER_CONFIDENCE_THRESHOLD:
+        if grok['confidence'] < ANALYZER_CONFIDENCE_THRESHOLD:
             rejection_reasons.append(
-                f"confidence_below_threshold({validator_result['confidence']}<{ANALYZER_CONFIDENCE_THRESHOLD})"
+                f"confidence_below_threshold({grok['confidence']}<{ANALYZER_CONFIDENCE_THRESHOLD})"
             )
 
         if rejection_reasons:
             logger.info(
                 f"[DECISION_ENGINE] Rejected after validation | ticker={market.get('ticker', 'UNKNOWN')} | "
-                f"validator={validator_name} | direction={validator_result['direction']} | "
-                f"confidence={validator_result['confidence']} | threshold={ANALYZER_CONFIDENCE_THRESHOLD} | "
+                f"validator=Grok | direction={grok['direction']} | "
+                f"confidence={grok['confidence']} | threshold={ANALYZER_CONFIDENCE_THRESHOLD} | "
                 f"reasons={', '.join(rejection_reasons)}"
             )
             return None
 
-    base_size = RISK_PER_TRADE
-    final_confidence = min(result['confidence'] for _, result in active_results)
-    confidence_multiplier = final_confidence / 100
-    size = base_size * confidence_multiplier
+        base_size = RISK_PER_TRADE
+        final_confidence = grok['confidence']
+        confidence_multiplier = final_confidence / 100
+        size = base_size * confidence_multiplier
 
-    internal_reason = f"Internal: {internal_decision}"
-    if internal_result["is_undervalued"]:
-        internal_reason += f" (undervalued=true, {internal_result['reason']})"
-    reason_parts = [internal_reason]
-    for validator_name, validator_result in active_results:
-        reason_parts.append(f"{validator_name}: {validator_result['reason']}")
+        internal_reason = f"Internal: {internal_decision}"
+        if internal_result["is_undervalued"]:
+            internal_reason += f" (undervalued=true, {internal_result['reason']})"
+        reason_parts = [internal_reason, f"Grok: {grok['reason']}"]
 
-    return {
-        "direction": internal_decision,
-        "size": round(size, 2),
-        "confidence": final_confidence,
-        "is_undervalued": internal_result["is_undervalued"],
-        "reason": " | ".join(reason_parts),
-    }
+        return {
+            "direction": internal_decision,
+            "size": round(size, 2),
+            "confidence": final_confidence,
+            "is_undervalued": internal_result["is_undervalued"],
+            "reason": " | ".join(reason_parts),
+        }
+
+    logger.info(
+        f"[DECISION_ENGINE] Rejected after validation | ticker={market.get('ticker', 'UNKNOWN')} | no external validators enabled"
+    )
+    return None

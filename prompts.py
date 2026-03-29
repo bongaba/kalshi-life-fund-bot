@@ -21,22 +21,25 @@ CRITICAL INSTRUCTIONS — FOLLOW EXACTLY AND IN THIS ORDER:
 1. Before any reasoning, you MUST use the browse_page tool on these sources in exact priority order. For every call, explicitly instruct the tool to extract: current BTC price + exact timestamp / "last updated" time.
 
    Priority:
-   - https://www.cfbenchmarks.com/data/indices/BRTI          ← Most important (official Kalshi settlement index)
+   - https://www.cfbenchmarks.com/data/indices/BRTI          ← Official Kalshi settlement index (reference only)
    - https://www.coingecko.com/en/coins/bitcoin
    - https://finance.yahoo.com/quote/BTC-USD
    - https://www.coinbase.com/price/bitcoin
 
-2. FRESHNESS RULE (STRICT & NON-NEGOTIABLE):
-   - All price data MUST be less than 3 minutes old **OR** the source explicitly states it is "live price", "real-time", or "calculated every second" (BRTI always qualifies as real-time).
-   - If you cannot confirm freshness or real-time status, immediately output HOLD.
+2. FRESHNESS RULE (STRICT BUT PRACTICAL):
+   - All price data should ideally be < 3 minutes old.
+   - When < 30 minutes to close: accept data up to 8 minutes old if at least two sources show consistent direction and momentum.
+   - When < 10 minutes to close: accept data up to 10 minutes old if the sources agree on direction.
+   - BRTI is often stale — treat it only as a loose reference. Never overweight or rely heavily on BRTI.
+   - If you cannot get reasonably fresh data from at least two sources, output HOLD.
 
-3. Kalshi settles on the trimmed 60-second average of the BRTI index at the exact resolution time ({hours_to_close:.1f} hours from now). Your single goal is to forecast whether THIS SPECIFIC MARKET will resolve YES or NO, based on the exact wording in the market title and description.
+3. Kalshi settles on the trimmed 60-second average of the BRTI index at the exact resolution time ({hours_to_close:.1f} hours from now). However, your prediction should be driven primarily by the freshest real-time prices and immediate momentum.
 
-4. You MUST also check current Bitcoin sentiment using x_keyword_search or x_semantic_search for posts from the last 1-minute.
+4. You MUST also check current Bitcoin sentiment using x_keyword_search or x_semantic_search for posts from the last 5 minutes.
 
 5. Pay very close attention to "Hours until close":
    - < 30 minutes left → rely **exclusively** on the freshest real-time sources (CoinGecko, Yahoo Finance, Coinbase). Ignore or heavily discount BRTI if it is older than 5 minutes. Base your decision on live market consensus.
-   - < 10 minutes left → use **only** sources that are < 3 minutes old. Completely ignore BRTI unless it is confirmed live/real-time. Focus on immediate price + order flow momentum.
+   - < 10 minutes left → use the most recent live sources available. Focus on immediate price + order flow momentum.
    - ≥ 30 minutes left → use consensus of the freshest sources + short-term trend and catalysts (BRTI may be used only as a loose reference)
 
 6. Analyze:
@@ -46,10 +49,10 @@ CRITICAL INSTRUCTIONS — FOLLOW EXACTLY AND IN THIS ORDER:
    - Real-time X sentiment
    - Any breaking news or macro catalysts
 
-7. Only output YES or NO if you have fresh data AND genuine 95%+ confidence in the direction. Otherwise output HOLD.
+7. Only output YES or NO if you have fresh consensus data from multiple live sources AND genuine 85%+ confidence in the direction. Otherwise output HOLD. On very short timeframes (<15 minutes), be willing to take a 75-85% confident call if the live price and momentum strongly support the direction.
 
 Output ONLY valid JSON. No other text whatsoever:
-{{"direction": "YES" or "NO" or "HOLD", "confidence": integer 0-100, "reason": "1 short BTC Price, primary source, timestamp, and key driver"}}"""
+{{"direction": "YES" or "NO" or "HOLD", "confidence": integer 0-100, "reason": "1 short BTC Price, ALL source prices + exact timestamps, consensus price, and key driver"}}"""
 
 
 def prompt_weather(market_title, description, yes_price, no_price, hours_to_close):
