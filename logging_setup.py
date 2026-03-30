@@ -100,3 +100,53 @@ def setup_log_file(filename: str, rotation: str = "1 day") -> Path:
         )
 
     return log_path
+
+
+def setup_error_log(rotation: str = "1 day") -> Path:
+    """Add a sink that captures only ERROR+ messages with full tracebacks."""
+    family_dir = LOGS_DIR / "errors"
+    family_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = family_dir / f"errors.{timestamp}_pid{os.getpid()}.log"
+
+    if log_path not in _CONFIGURED_LOG_FILES:
+        logger.add(
+            str(log_path),
+            level="ERROR",
+            rotation=rotation,
+            enqueue=True,
+            backtrace=True,
+            diagnose=True,
+        )
+        _CONFIGURED_LOG_FILES.add(log_path)
+
+    return log_path
+
+
+def setup_trade_decision_log(rotation: str = "1 day") -> Path:
+    """Add a sink that captures trade decision pipeline messages.
+
+    Filters for log messages containing [DECISION], [TRADE], or [ORDER] tags.
+    """
+    family_dir = LOGS_DIR / "trade_decisions"
+    family_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = family_dir / f"trade_decisions.{timestamp}_pid{os.getpid()}.log"
+
+    def _decision_filter(record):
+        msg = record["message"]
+        return any(tag in msg for tag in (
+            "[DECISION", "[TRADE", "[ORDER", "[GROK", "[EXIT",
+            "CONSIDERING:",
+        ))
+
+    if log_path not in _CONFIGURED_LOG_FILES:
+        logger.add(
+            str(log_path),
+            filter=_decision_filter,
+            rotation=rotation,
+            enqueue=True,
+        )
+        _CONFIGURED_LOG_FILES.add(log_path)
+
+    return log_path

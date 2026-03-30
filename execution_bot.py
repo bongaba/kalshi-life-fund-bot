@@ -7,7 +7,7 @@ import base64
 import json
 from datetime import datetime, timezone
 from loguru import logger
-from logging_setup import setup_log_file
+from logging_setup import setup_log_file, setup_error_log, setup_trade_decision_log
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
@@ -18,6 +18,8 @@ from discord_notifications import notify_trade_executed, notify_error, notify_st
 import winsound
 
 setup_log_file("bot.log")
+setup_error_log()
+setup_trade_decision_log()
 
 
 def get_decision_mode_label() -> str:
@@ -770,7 +772,7 @@ def main_loop():
 
             if decision:
                 decided_to_trade += 1
-                logger.success(f"DECISION TO TRADE: {ticker} | {decision['direction']} | size=${decision['size']:.2f} | {decision['reason']}")
+                logger.success(f"[DECISION] TRADE: {ticker} | {decision['direction']} | conf={decision['confidence']}% | size=${decision['size']:.2f} | {decision['reason']}")
 
                 side = "yes" if decision["direction"] == "YES" else "no"
                 action = "buy"
@@ -807,7 +809,7 @@ def main_loop():
                     db_status = 'OPEN' if actually_filled else 'CANCELED'
 
                     logger.success(
-                        f"ORDER ACCEPTED: {ticker} | client_order_id={client_order_id} | "
+                        f"[ORDER] ACCEPTED: {ticker} | client_order_id={client_order_id} | "
                         f"kalshi_order_id={kalshi_order_id or 'unknown'} | status={order_status or 'unknown'} | "
                         f"filled={fill_count_fp} | db_status={db_status}"
                     )
@@ -831,7 +833,7 @@ def main_loop():
                             logger.warning(f"Could not fetch fills for {ticker}, using limit price ${contract_price:.4f}")
 
                         trade_msg = (
-                            f"TRADE PLACED: {decision['direction']} on {ticker}\n"
+                            f"[TRADE] EXECUTED: {decision['direction']} on {ticker}\n"
                             f"Quantity: {count}\n"
                             f"Price: ${contract_price:.4f}\n"
                             f"Total Cost: ${total_order_cost:.2f}\n"
@@ -909,7 +911,7 @@ def main_loop():
                     )
 
             else:
-                logger.info(f"   → No trade decision for {ticker}")
+                logger.info(f"[DECISION] SKIP: {ticker} | yes=${yes_price:.3f} | no=${no_price:.3f} | vol={volume:,.0f}")
 
         update_resolved_trades()
 

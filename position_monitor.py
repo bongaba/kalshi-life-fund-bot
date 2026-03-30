@@ -87,7 +87,7 @@ import uuid
 import threading
 from datetime import datetime, timezone
 from loguru import logger
-from logging_setup import setup_log_file
+from logging_setup import setup_log_file, setup_error_log, setup_trade_decision_log
 from config import *
 from discord_notifications import notify_position_closed
 from cryptography.hazmat.primitives import serialization
@@ -101,6 +101,8 @@ import os
 import asyncio
 
 setup_log_file("monitor.log")
+setup_error_log()
+setup_trade_decision_log()
 
 TAKE_PROFIT_PERCENT = POSITION_TAKE_PROFIT_PERCENT
 STOP_LOSS_PERCENT = POSITION_STOP_LOSS_PERCENT
@@ -1054,7 +1056,7 @@ def monitor_positions_once():
                 else:
                     logger.debug(f"WS loop not available for dynamic subscription of {ticker}")
             except Exception as e:
-                logger.debug(f"Failed to dynamically subscribe to {ticker}: {e}")
+                logger.error(f"Failed to dynamically subscribe to ticker {ticker}: {e}")
 
         # The API returns position_fp (fixed point format like "-78.00" for shorts)
         raw_position = position.get('position_fp', '0')
@@ -1164,7 +1166,7 @@ def monitor_positions_once():
 
             if severe_breach:
                 logger.warning(
-                    f"{ticker}: SEVERE stop-loss breach (pnl=${unrealized_pnl:.2f} vs threshold -${sl_dollar:.2f}) — "
+                    f"[EXIT] SEVERE: {ticker} | pnl=${unrealized_pnl:.2f} vs threshold -${sl_dollar:.2f} — "
                     f"skipping confirmation, exiting immediately"
                 )
                 exit_reason = f"{exit_reason} (severe breach — immediate exit)"
@@ -1173,7 +1175,7 @@ def monitor_positions_once():
                 STOP_LOSS_CONSECUTIVE_HITS[ticker] = hits
                 if hits < STOP_LOSS_CONFIRMATIONS_REQUIRED:
                     logger.warning(
-                        f"{ticker}: stop-loss breach {hits}/{STOP_LOSS_CONFIRMATIONS_REQUIRED} | "
+                        f"[EXIT] CONFIRM_WAIT: {ticker} | stop-loss breach {hits}/{STOP_LOSS_CONFIRMATIONS_REQUIRED} | "
                         f"{exit_reason} — waiting for confirmation"
                     )
                     should_exit = False
@@ -1216,7 +1218,8 @@ def monitor_positions_once():
             continue
 
         logger.warning(
-            f"Exit trigger hit for {ticker}: {trigger} | pnl=${unrealized_pnl:.2f} | pnl_pct={unrealized_pnl_pct:.2f}% | "
+            f"[EXIT] TRIGGER: {ticker} | {trigger} | dir={direction} | contracts={contracts} | "
+            f"entry=${entry_price:.3f} | mark=${current_price:.3f} | pnl=${unrealized_pnl:.2f} ({unrealized_pnl_pct:.2f}%) | "
             f"reason={exit_reason}"
         )
 
@@ -1274,8 +1277,9 @@ def monitor_positions_once():
             realized_pnl_pct = ((exit_price - entry_price) / entry_price * 100.0) if entry_price > 0 else 0.0
 
             logger.success(
-                f"Close order sent | ticker={ticker} | trigger={trigger} | body={json.dumps(order_body)} | "
-                f"response={json.dumps(response)}"
+                f"[EXIT] CLOSED: {ticker} | trigger={trigger} | dir={direction} | contracts={contracts} | "
+                f"entry=${entry_price:.4f} | exit=${exit_price:.4f} | fees=${entry_fees + exit_fees:.2f} | "
+                f"pnl=${realized_pnl:.2f} ({realized_pnl_pct:.2f}%) | order={json.dumps(order_body)}"
             )
 
             # Mark all OPEN fills in DB as CLOSED with realized P&L

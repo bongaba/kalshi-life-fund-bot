@@ -37,31 +37,55 @@ class KalshiWebSocketClient:
             logger.error(f"Failed to read private key file for WebSocket: {e}")
 
     async def connect(self):
+        """Connect to Kalshi WS with automatic reconnection on failure."""
         self._loop = asyncio.get_event_loop()
-        async with websockets.connect(KALSHI_WS_URL, additional_headers=self._auth_headers()) as ws:
-            self.ws = ws
-            self._connected = True
-            logger.info("WebSocket connected. Subscribing to tickers...")
-            await self._subscribe_all()
-            await self._listen()
+        backoff = 1  # seconds
+        max_backoff = 60
+        while True:
+            try:
+                async with websockets.connect(
+                    KALSHI_WS_URL,
+                    additional_headers=self._auth_headers(),
+                    ping_interval=20,
+                    ping_timeout=10,
+                ) as ws:
+                    self.ws = ws
+                    self._connected = True
+                    backoff = 1  # reset on successful connect
+                    logger.info("WebSocket connected. Subscribing to tickers...")
+                    await self._subscribe_all()
+                    await self._listen()
+            except Exception as e:
+                self._connected = False
+                self.ws = None
+                logger.warning(f"WebSocket disconnected: {e}. Reconnecting in {backoff}s...")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+
+    @property
+    def is_connected(self):
+        return self._connected and self.ws is not None
 
     async def subscribe_ticker(self, ticker: str):
         async with self._lock:
             if ticker not in self.tickers:
                 self.tickers.add(ticker)
-                if self.ws:
-                    sub_msg = {
-                        "id": int(time.time() * 1000),
-                        "cmd": "subscribe",
-                        "params": {
-                            "channels": ["orderbook_delta"],
-                            "market_ticker": ticker
+                if self._connected and self.ws:
+                    try:
+                        sub_msg = {
+                            "id": int(time.time() * 1000),
+                            "cmd": "subscribe",
+                            "params": {
+                                "channels": ["orderbook_delta"],
+                                "market_ticker": ticker
+                            }
                         }
-                    }
-                    await self.ws.send(json.dumps(sub_msg))
-                    logger.info(f"Dynamically subscribed to orderbook_delta for {ticker}")
+                        await self.ws.send(json.dumps(sub_msg))
+                        logger.info(f"Dynamically subscribed to orderbook_delta for {ticker}")
+                    except Exception as e:
+                        logger.warning(f"Failed to subscribe {ticker}: {e}. Will retry on reconnect.")
                 else:
-                    logger.warning(f"Tried to subscribe to {ticker} but WebSocket is not connected.")
+                    logger.warning(f"WS not connected — {ticker} queued for subscription on reconnect.")
 
     def _auth_headers(self):
         # Kalshi WebSocket authentication: signed headers
