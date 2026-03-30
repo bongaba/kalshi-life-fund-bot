@@ -293,32 +293,36 @@ def _book_to_sorted_list(book_dict):
 def handle_orderbook_ws(ticker, msg_type, data):
     """Handle orderbook_snapshot and orderbook_delta from Kalshi WS.
 
-    Snapshots replace the entire book.  Deltas merge into the existing book
-    (size=0 removes a price level).
-    """
-    yes_levels = data.get("yes", [])
-    no_levels = data.get("no", [])
+    Kalshi WS format:
+      Snapshot: { yes_dollars_fp: [[price, size], ...], no_dollars_fp: [[price, size], ...] }
+      Delta:    { price_dollars: "0.95", delta_fp: "100.00", side: "yes"|"no" }
 
+    Snapshots replace the entire book.  Deltas merge into the existing book
+    (size=0 or negative delta removes a price level).
+    """
     if msg_type == "orderbook_snapshot":
-        # Full replacement
+        # Kalshi uses yes_dollars_fp / no_dollars_fp for snapshots
+        yes_levels = data.get("yes_dollars_fp", data.get("yes", []))
+        no_levels = data.get("no_dollars_fp", data.get("no", []))
         yes_book = {float(p): float(s) for p, s in yes_levels} if yes_levels else {}
         no_book = {float(p): float(s) for p, s in no_levels} if no_levels else {}
         WS_ORDERBOOKS[ticker] = {"yes": yes_book, "no": no_book}
     else:
-        # Delta: merge into existing book
+        # Delta: single price level update with side, price_dollars, delta_fp
         existing = WS_ORDERBOOKS.get(ticker, {"yes": {}, "no": {}})
-        for p, s in (yes_levels or []):
-            price, size = float(p), float(s)
-            if size <= 0:
-                existing["yes"].pop(price, None)
+        side = data.get("side", "")
+        price_str = data.get("price_dollars")
+        delta_str = data.get("delta_fp")
+
+        if price_str is not None and delta_str is not None and side in ("yes", "no"):
+            price = float(price_str)
+            delta = float(delta_str)
+            current_size = existing[side].get(price, 0.0)
+            new_size = current_size + delta
+            if new_size <= 0:
+                existing[side].pop(price, None)
             else:
-                existing["yes"][price] = size
-        for p, s in (no_levels or []):
-            price, size = float(p), float(s)
-            if size <= 0:
-                existing["no"].pop(price, None)
-            else:
-                existing["no"][price] = size
+                existing[side][price] = new_size
         WS_ORDERBOOKS[ticker] = existing
 
     # Build sorted arrays and push to REALTIME_QUOTES
@@ -342,13 +346,11 @@ def handle_orderbook_ws(ticker, msg_type, data):
     if no_best:
         parts.append(f"NO best_bid=${no_best[0]:.2f}×{no_best[1]:.0f}")
     parts.append(f"depth=Y{len(yes_sorted)}/N{len(no_sorted)}")
-    if yes_levels or no_levels:
-        changes = []
-        for p, s in (yes_levels or []):
-            changes.append(f"Y${float(p):.2f}→{float(s):.0f}")
-        for p, s in (no_levels or []):
-            changes.append(f"N${float(p):.2f}→{float(s):.0f}")
-        parts.append(f"changes=[{', '.join(changes)}]")
+    if msg_type == "orderbook_delta":
+        side = data.get("side", "?")
+        price_str = data.get("price_dollars", "?")
+        delta_str = data.get("delta_fp", "?")
+        parts.append(f"change={side.upper()[0]}${price_str}→Δ{delta_str}")
     logger.info(" | ".join(parts))
 
 # Start the WebSocket client in a background thread and allow dynamic subscription

@@ -70,12 +70,15 @@ CRITICAL INSTRUCTIONS — FOLLOW EXACTLY AND IN THIS ORDER:
    MARKET TITLE: {market_title}
    MARKET DESCRIPTION: {description}
 
+**CRITICAL EARLY EXIT RULE (apply immediately after parsing):**
+   If the market is a narrow bin or tight range-bound event (e.g. exactly 75-76°, 90-100, 10 to 100, or any range smaller than ~5 degrees for temperature or equivalent tight range for other events), immediately output HOLD. Do not proceed with browsing tools.
+
 2. Before any reasoning, you MUST use the browse_page tool on these sources in exact priority order. For every call, explicitly instruct the tool to extract the event identified in step 1, the exact issuance time / "last updated" timestamp for EVERY source, and any uncertainty or model discussion.
 
    Priority (adapt URLs using the airport/station from step 1):
-   - Official NWS Climatological Report (Daily CLI) — https://forecast.weather.gov/product.php?site=XXX&product=CLI&issuedby=XXX
+   - Official NWS Climatological Report (Daily CLI)
    - Latest Area Forecast Discussion (AFD) for the responsible NWS office
-   - Latest HRRR model output + real-time observations for the station[](https://www.weather.gov/wrh/timeseries?site=XXX)
+   - Latest HRRR model output + real-time observations for the station
    - National Blend of Models (NBM) short-range consensus
 
 3. FRESHNESS RULE (STRICT & NON-NEGOTIABLE):
