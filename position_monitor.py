@@ -123,6 +123,14 @@ _TRAILING_MARKS_LOADED = False  # flag so we only load from DB once per process
 STOP_LOSS_CONFIRMATIONS_REQUIRED = 3
 STOP_LOSS_CONSECUTIVE_HITS = {}  # ticker -> consecutive breach count
 
+# Trailing TP confirmation: base requirement, scales up when deep in profit
+TRAILING_TP_CONFIRMATIONS_BASE = 2
+TRAILING_TP_CONFIRMATIONS_DEEP_PROFIT = 3  # when ≥30% of max profit realized
+TRAILING_TP_CONSECUTIVE_HITS = {}  # ticker -> consecutive breach count
+
+# Only activate trailing TP once profit exceeds this fraction of max_payout
+TRAILING_TP_ACTIVATION_PCT = 0.10  # 10% of max_payout
+
 
 def _ensure_trailing_marks_table(conn):
     """Create the trailing_marks table if it doesn't exist."""
@@ -196,7 +204,7 @@ def compute_smart_exit(entry_price, current_price, direction, seconds_to_close, 
     # Tier 3 (<$0.75): 15% of max_payout — tight protection for higher risk entries
     TIER1_THRESHOLD = 0.82
     TIER2_THRESHOLD = 0.75
-    TIER1_STOP_DROP = 0.15  # absolute 15¢ drop from entry
+    TIER1_STOP_DROP = 0.20  # absolute 20¢ drop from entry
 
     if entry_price >= TIER1_THRESHOLD:
         # Tier 1: absolute price floor
@@ -251,36 +259,64 @@ def update_trailing_mark(ticker, current_price, direction="YES", conn=None):
 def check_trailing_take_profit(ticker, entry_price, current_price, direction="YES", fee_per_contract=0.0, contracts=1):
     """Check if price has dropped from peak enough to trigger trailing take-profit.
 
-    Uses a dollar-based trailing drop: 5% of total max_payout.
-    The trailing drop is converted to a per-contract price distance so it can
-    be compared against the price watermarks.
-
-    Once a position is in profit, the trailing floor is clamped to at minimum
-    the breakeven price (entry + fees).  This guarantees we never exit into a
-    net loss after fees are applied.
+    Trailing distance is tiered by entry price and tightens dynamically as
+    unrealized profit grows.  Trailing only activates once the position has
+    reached at least TRAILING_TP_ACTIVATION_PCT of max_payout in profit.
     """
-    # Trailing drop: 15% of total max_payout, converted to per-contract price distance
-    TRAILING_DROP_PCT = 0.15
     total_fees = fee_per_contract * contracts
     max_payout = max(0.01, contracts * (1.0 - entry_price) - total_fees)
-    trailing_drop_dollars = max_payout * TRAILING_DROP_PCT
-    # Convert total dollar drop to per-contract price distance
-    trailing_drop = trailing_drop_dollars / contracts if contracts > 0 else 0.02
-    # Minimum trailing distance to avoid noise exits
-    trailing_drop = max(trailing_drop, 0.02)
 
     # Breakeven = entry price + round-trip fees per contract + safety buffer
     FEE_SAFETY_BUFFER = 0.01
     breakeven = entry_price + fee_per_contract + FEE_SAFETY_BUFFER
 
-    # Both YES and NO use the same logic: track peak, exit if drops from peak
     high = TRAILING_HIGH.get(ticker, current_price)
-    if high <= breakeven:
-        return False, None  # never been above breakeven
+
+    # --- Activation gate: don't trail until meaningful profit is reached ---
+    # Peak must have exceeded entry by at least ACTIVATION_PCT of max_payout
+    activation_threshold = breakeven + (max_payout * TRAILING_TP_ACTIVATION_PCT) / contracts
+    if high <= activation_threshold:
+        return False, None
+
+    # --- Tiered base trailing distance by entry price ---
+    if entry_price >= 0.90:
+        base_pct = 0.055      # 5.5% for very high confidence entries
+    elif entry_price >= 0.80:
+        base_pct = 0.045      # 4.5%
+    else:
+        base_pct = 0.035      # 3.5% for lower entries
+
+    trailing_drop = base_pct * entry_price
+
+    # --- Dynamic tightening as profit grows ---
+    # current_pnl_pct = fraction of max_payout already captured at peak
+    peak_profit_per_contract = high - entry_price - fee_per_contract
+    max_profit_per_contract = (1.0 - entry_price) - fee_per_contract
+    if max_profit_per_contract > 0:
+        profit_fraction = peak_profit_per_contract / max_profit_per_contract
+    else:
+        profit_fraction = 0.0
+
+    if profit_fraction >= 0.40:
+        trailing_drop *= 0.65   # tighten significantly — lock in most of the gain
+    elif profit_fraction >= 0.25:
+        trailing_drop *= 0.80   # moderate tightening
+
+    # Also factor in the max_payout-based drop (original logic) and take the larger
+    trailing_drop_payout = (max_payout * 0.15) / contracts if contracts > 0 else 0.02
+    trailing_drop = max(trailing_drop, trailing_drop_payout)
+
+    # Absolute minimum floor: 3.5¢ for high entries, 3¢ for lower
+    abs_min = 0.035 if entry_price >= 0.80 else 0.03
+    trailing_drop = max(trailing_drop, abs_min)
+
     # Floor = peak minus trailing drop, but NEVER below breakeven
     floor = max(breakeven, high - trailing_drop)
     if current_price <= floor:
-        return True, f"trailing TP: peak=${high:.3f} floor=${floor:.3f} breakeven=${breakeven:.3f} now=${current_price:.3f} (trail=${trailing_drop:.4f})"
+        return True, (
+            f"trailing TP: peak=${high:.3f} floor=${floor:.3f} breakeven=${breakeven:.3f} "
+            f"now=${current_price:.3f} (trail=${trailing_drop:.4f} profit_frac={profit_fraction:.0%})"
+        )
     return False, None
 
 # --- WebSocket orderbook state ---
@@ -1013,16 +1049,21 @@ def monitor_positions_once():
     db_open_tickers = {row[0] for row in cursor.fetchall()}
     stale_tickers = db_open_tickers - api_tickers - RECONCILED_SETTLED_TICKERS
     for stale_ticker in stale_tickers:
-        rows_closed = cursor.execute(
+        # Tag trades that had no prior exit mechanism as held_to_settlement
+        cursor.execute(
             """
             UPDATE trades
             SET status = 'SETTLED',
-                reason = reason || ' | auto-settled (zero exchange position)',
+                reason = reason || CASE
+                    WHEN reason NOT LIKE '%[EXIT]%' THEN ' | [EXIT] held_to_settlement'
+                    ELSE ''
+                END || ' | auto-settled (zero exchange position)',
                 resolved_timestamp = datetime('now')
             WHERE market_ticker = ? AND status = 'OPEN'
             """,
             (stale_ticker,),
-        ).rowcount
+        )
+        rows_closed = cursor.rowcount
         if rows_closed:
             logger.warning(
                 f"Reconciliation: {stale_ticker} has 0 contracts on exchange but {rows_closed} "
@@ -1157,7 +1198,7 @@ def monitor_positions_once():
             max_payout = max(0.01, contracts * (1.0 - entry_price) - total_fees)
             unrealized_pnl = contracts * (current_price - entry_price) - total_fees
             if entry_price >= 0.82:
-                sl_dollar = contracts * 0.15  # tier1: absolute 15¢
+                sl_dollar = contracts * 0.20  # tier1: absolute 20¢
             elif entry_price >= 0.75:
                 sl_dollar = max(max_payout * 0.25, contracts * 0.02)  # tier2: 25%
             else:
@@ -1191,8 +1232,31 @@ def monitor_positions_once():
         if not should_exit:
             should_exit, trailing_reason = check_trailing_take_profit(ticker, entry_price, current_price, direction, fee_per_contract=fee_per_contract, contracts=contracts)
             if should_exit:
-                trigger = "take_profit"
-                exit_reason = trailing_reason
+                # Dynamic confirmation count: more confirmations when deep in profit
+                total_fees_tp = fee_per_contract * contracts
+                max_profit_pc = (1.0 - entry_price) - fee_per_contract
+                peak_profit_pc = TRAILING_HIGH.get(ticker, current_price) - entry_price - fee_per_contract
+                profit_frac = peak_profit_pc / max_profit_pc if max_profit_pc > 0 else 0.0
+                confirmations_needed = (
+                    TRAILING_TP_CONFIRMATIONS_DEEP_PROFIT if profit_frac >= 0.30
+                    else TRAILING_TP_CONFIRMATIONS_BASE
+                )
+
+                tp_hits = TRAILING_TP_CONSECUTIVE_HITS.get(ticker, 0) + 1
+                TRAILING_TP_CONSECUTIVE_HITS[ticker] = tp_hits
+                if tp_hits < confirmations_needed:
+                    logger.warning(
+                        f"[EXIT] TP_CONFIRM_WAIT: {ticker} | trailing TP breach {tp_hits}/{confirmations_needed} | "
+                        f"current=${current_price:.3f} | floor from trail | profit_frac={profit_frac:.0%} | "
+                        f"{trailing_reason} — waiting for confirmation"
+                    )
+                    should_exit = False
+                else:
+                    trigger = "take_profit"
+                    exit_reason = f"{trailing_reason} (confirmed {tp_hits}/{confirmations_needed})"
+            else:
+                # Price recovered above trailing floor — reset counter
+                TRAILING_TP_CONSECUTIVE_HITS.pop(ticker, None)
 
         ttc_str = f"{seconds_to_close:.0f}s" if seconds_to_close is not None else "unknown"
         trail_str = f"${TRAILING_HIGH.get(ticker, 0):.3f}"
@@ -1290,6 +1354,7 @@ def monitor_positions_once():
             # Clean trailing marks for closed position
             TRAILING_HIGH.pop(ticker, None)
             STOP_LOSS_CONSECUTIVE_HITS.pop(ticker, None)
+            TRAILING_TP_CONSECUTIVE_HITS.pop(ticker, None)
             _delete_trailing_mark(conn, ticker)
 
             # Alert if loss exceeds -20% (severe loss on binary contract)
