@@ -161,7 +161,7 @@ def send_discord_notification(message: str, embed_data: dict = None):
         payload["embeds"] = [embed]
 
     try:
-        response = requests.post(DISCORD_WEBHOOK_URL, json=payload)
+        response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
         if response.status_code == 204:
             print("[DISCORD] Notification sent successfully")
             return True

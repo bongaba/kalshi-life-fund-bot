@@ -1,9 +1,9 @@
 # --- Real-time quote access ---
 # WebSocket quotes are trusted for longer — the book is maintained incrementally
 # via snapshots + deltas so it should always reflect the true state.
-WS_QUOTE_FRESHNESS_SECONDS = 30  # WS-maintained book stays valid much longer
+WS_QUOTE_FRESHNESS_SECONDS = 10  # WS-maintained book — tight window to detect disconnects
 REST_FALLBACK_COOLDOWN = {}      # ticker -> last REST fetch timestamp (avoid spamming)
-REST_FALLBACK_MIN_INTERVAL = 10  # seconds between REST fallback calls per ticker
+REST_FALLBACK_MIN_INTERVAL = 3   # seconds between REST fallback calls per ticker
 
 def get_realtime_executable_quote(ticker, direction):
     """Get the best executable bid for selling a position.
@@ -90,6 +90,7 @@ from loguru import logger
 from logging_setup import setup_log_file, setup_error_log, setup_trade_decision_log
 from config import *
 from discord_notifications import notify_position_closed
+import discord_bot
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
@@ -273,8 +274,12 @@ def check_trailing_take_profit(ticker, entry_price, current_price, direction="YE
     high = TRAILING_HIGH.get(ticker, current_price)
 
     # --- Activation gate: don't trail until meaningful profit is reached ---
-    # Peak must have exceeded entry by at least ACTIVATION_PCT of max_payout
-    activation_threshold = breakeven + (max_payout * TRAILING_TP_ACTIVATION_PCT) / contracts
+    # Tiered: higher gate for <80¢ entries (more runway, need more profit before trailing)
+    if entry_price >= 0.80:
+        activation_pct = TRAILING_TP_ACTIVATION_PCT  # 10% of max_payout
+    else:
+        activation_pct = 0.25  # 25% of max_payout for lower entries
+    activation_threshold = breakeven + (max_payout * activation_pct) / contracts
     if high <= activation_threshold:
         return False, None
 
@@ -284,7 +289,7 @@ def check_trailing_take_profit(ticker, entry_price, current_price, direction="YE
     elif entry_price >= 0.80:
         base_pct = 0.045      # 4.5%
     else:
-        base_pct = 0.035      # 3.5% for lower entries
+        base_pct = 0.05       # 5.0% for lower entries — wider to avoid premature exits
 
     trailing_drop = base_pct * entry_price
 
@@ -315,7 +320,7 @@ def check_trailing_take_profit(ticker, entry_price, current_price, direction="YE
     if current_price <= floor:
         return True, (
             f"trailing TP: peak=${high:.3f} floor=${floor:.3f} breakeven=${breakeven:.3f} "
-            f"now=${current_price:.3f} (trail=${trailing_drop:.4f} profit_frac={profit_fraction:.0%})"
+            f"now=${current_price:.3f} (trail=${trailing_drop:.4f} profit_frac={profit_fraction:.0%})" 
         )
     return False, None
 
@@ -414,6 +419,7 @@ def start_ws_client(tickers):
 SETTLEMENT_HOLD_ENABLED = POSITION_MONITOR_HOLD_FOR_SETTLEMENT
 SETTLEMENT_HOLD_SECONDS = POSITION_MONITOR_SETTLEMENT_HOLD_SECONDS
 PENDING_CLOSE_UNTIL = {}
+PENDING_DISCORD_APPROVALS = {}  # ticker -> True, tracks tickers awaiting Discord approval
 RECONCILED_SETTLED_TICKERS = set()  # Track tickers already marked settled to avoid log spam
 
 host = "https://demo-api.kalshi.co" if MODE == "demo" else "https://api.elections.kalshi.com"
@@ -466,9 +472,9 @@ def signed_request(method, path, params=None, body=None):
     url = f"{host}{full_path}"
 
     if method.upper() == "GET":
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=5)
     elif method.upper() == "POST":
-        response = requests.post(url, headers=headers, json=body)
+        response = requests.post(url, headers=headers, json=body, timeout=5)
     else:
         raise ValueError(f"Unsupported method: {method}")
 
@@ -1031,6 +1037,108 @@ def notify_position_closed_async(
     thread.start()
 
 
+def _execute_exit(ticker, direction, contracts, entry_price, entry_fees, trigger, exit_reason, close_key):
+    """Execute an exit order for a position. Thread-safe — opens its own DB connection."""
+    try:
+        if trigger == "stop_loss":
+            slippage_schedule = [0.02, 0.04, 0.06]
+        else:
+            slippage_schedule = [0.01, 0.02, 0.04]
+
+        now_ts = time.time()
+        order_filled = False
+        fresh_quote = None
+        for attempt, slippage in enumerate(slippage_schedule, 1):
+            fresh_quote, fresh_reason = get_realtime_executable_quote(ticker, direction)
+            if not fresh_quote:
+                logger.error(f"Atomic close failed: no fresh quote for {ticker} {direction} (reason={fresh_reason})")
+                break
+
+            PENDING_CLOSE_UNTIL[close_key] = now_ts + POSITION_CLOSE_COOLDOWN_SECONDS
+            response, order_body = place_ioc_close_order(ticker, direction, contracts, fresh_quote, slippage_pct=slippage)
+            order_data = response.get("order", {}) if isinstance(response, dict) else {}
+            order_status = order_data.get("status") or response.get("status") if isinstance(response, dict) else None
+
+            if order_status in ("canceled", "cancelled"):
+                slippage_cents = int(round(fresh_quote['bid'] * 100 * slippage))
+                logger.warning(
+                    f"IOC close attempt {attempt}/{len(slippage_schedule)} for {ticker} canceled "
+                    f"(slippage={slippage:.0%} = {slippage_cents}¢). {'Retrying...' if attempt < len(slippage_schedule) else 'Will retry next cycle.'}"
+                )
+                time.sleep(0.3)
+                continue
+
+            order_filled = True
+            break
+
+        if not order_filled:
+            PENDING_CLOSE_UNTIL.pop(close_key, None)
+            return
+
+        # Fetch actual fill price and fees from exchange
+        sell_side = "yes" if direction == "YES" else "no"
+        kalshi_order_id = order_data.get('order_id')
+        actual_exit_price, exit_fees = fetch_fill_price_and_fees(kalshi_order_id, sell_side) if kalshi_order_id else (None, 0.0)
+
+        if actual_exit_price is not None:
+            exit_price = actual_exit_price
+            logger.info(f"Actual exit fill price for {ticker}: ${exit_price:.4f} (fees: ${exit_fees:.2f})")
+        else:
+            exit_price = fresh_quote["bid"]
+            exit_fees = 0.0
+            logger.warning(f"Could not fetch exit fills for {ticker}, using quote price ${exit_price:.4f}")
+
+        realized_pnl = contracts * (exit_price - entry_price) - entry_fees - exit_fees
+        realized_pnl_pct = ((exit_price - entry_price) / entry_price * 100.0) if entry_price > 0 else 0.0
+
+        logger.success(
+            f"[EXIT] CLOSED: {ticker} | trigger={trigger} | dir={direction} | contracts={contracts} | "
+            f"entry=${entry_price:.4f} | exit=${exit_price:.4f} | fees=${entry_fees + exit_fees:.2f} | "
+            f"pnl=${realized_pnl:.2f} ({realized_pnl_pct:.2f}%) | order={json.dumps(order_body)}"
+        )
+
+        # Own DB connection for thread safety
+        conn = sqlite3.connect("trades.db", timeout=5)
+        cursor = conn.cursor()
+        try:
+            rows_closed = mark_fills_closed(cursor, ticker, exit_price, trigger)
+            conn.commit()
+            logger.info(f"Marked {rows_closed} OPEN fill(s) as CLOSED for {ticker} at exit={exit_price:.4f}")
+            _delete_trailing_mark(conn, ticker)
+        finally:
+            conn.close()
+
+        # Clean trailing marks for closed position
+        TRAILING_HIGH.pop(ticker, None)
+        STOP_LOSS_CONSECUTIVE_HITS.pop(ticker, None)
+        TRAILING_TP_CONSECUTIVE_HITS.pop(ticker, None)
+
+        if trigger == "stop_loss" and realized_pnl_pct < -20.0:
+            logger.error(f"ALERT: Close order for {ticker} executed with severe loss {realized_pnl_pct:.2f}%")
+
+        notify_position_closed_async(
+            ticker=ticker,
+            direction=direction,
+            quantity=contracts,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            pnl_dollars=realized_pnl,
+            pnl_percent=realized_pnl_pct,
+            trigger=trigger,
+            order_status=order_status,
+            entry_fees=entry_fees,
+            exit_fees=exit_fees,
+        )
+    except Exception as close_err:
+        PENDING_CLOSE_UNTIL.pop(close_key, None)
+        response = getattr(close_err, 'response', None)
+        status_code = getattr(response, 'status_code', 'unknown')
+        response_body = (getattr(response, 'text', '') or '')[:1000]
+        logger.error(
+            f"Close order failed for {ticker}: {close_err} | status={status_code} | body={response_body or 'N/A'}"
+        )
+
+
 def monitor_positions_once():
     """Monitor live positions and submit IOC close orders at configured P&L % thresholds."""
     logger.info("Checking open positions for take-profit/stop-loss exits...")
@@ -1192,6 +1300,7 @@ def monitor_positions_once():
 
         # Stop-loss confirmation: require N consecutive breaches to filter volatility
         # BUT: skip confirmations for severe breaches (2x+ threshold) — exit immediately
+        severe_breach = False
         if should_exit and trigger == "stop_loss":
             # Compute the effective SL threshold for this tier to check severity
             total_fees = fee_per_contract * contracts
@@ -1287,102 +1396,50 @@ def monitor_positions_once():
             f"reason={exit_reason}"
         )
 
-
-        try:
-            # Percentage-based slippage: scales with price so you never give up too much
-            # Stop-losses are more aggressive to guarantee a fill
-            if trigger == "stop_loss":
-                slippage_schedule = [0.02, 0.04, 0.06]  # 2%, 4%, 6% below bid
-            else:
-                slippage_schedule = [0.01, 0.02, 0.04]  # 1%, 2%, 4% below bid
-
-            order_filled = False
-            for attempt, slippage in enumerate(slippage_schedule, 1):
-                fresh_quote, fresh_reason = get_realtime_executable_quote(ticker, direction)
-                if not fresh_quote:
-                    logger.error(f"Atomic close failed: no fresh quote for {ticker} {direction} (reason={fresh_reason})")
-                    break
-
-                PENDING_CLOSE_UNTIL[close_key] = now_ts + POSITION_CLOSE_COOLDOWN_SECONDS
-                response, order_body = place_ioc_close_order(ticker, direction, contracts, fresh_quote, slippage_pct=slippage)
-                order_data = response.get("order", {}) if isinstance(response, dict) else {}
-                order_status = order_data.get("status") or response.get("status") if isinstance(response, dict) else None
-
-                if order_status in ("canceled", "cancelled"):
-                    slippage_cents = int(round(fresh_quote['bid'] * 100 * slippage))
-                    logger.warning(
-                        f"IOC close attempt {attempt}/{len(slippage_schedule)} for {ticker} canceled "
-                        f"(slippage={slippage:.0%} = {slippage_cents}¢). {'Retrying...' if attempt < len(slippage_schedule) else 'Will retry next cycle.'}"
-                    )
-                    time.sleep(0.3)  # Brief pause between retries
-                    continue
-
-                order_filled = True
-                break
-
-            if not order_filled:
-                PENDING_CLOSE_UNTIL.pop(close_key, None)  # Allow retry next cycle
+        # --- Interactive Discord approval (non-blocking) ---
+        if DISCORD_INTERACTIVE_SL_TP and discord_bot.is_configured() and not severe_breach:
+            # If this ticker is already pending approval, skip (don't double-send)
+            if ticker in PENDING_DISCORD_APPROVALS:
+                logger.debug(f"[EXIT] Already pending Discord approval for {ticker}, skipping")
+                continue
+            ttc_for_discord = int(seconds_to_close) if seconds_to_close is not None else None
+            msg_id = discord_bot.send_approval_request(
+                ticker=ticker,
+                trigger=trigger,
+                direction=direction,
+                contracts=contracts,
+                entry_price=entry_price,
+                current_price=current_price,
+                unrealized_pnl=unrealized_pnl,
+                pnl_pct=unrealized_pnl_pct,
+                reason=exit_reason or "",
+                ttc_seconds=ttc_for_discord,
+            )
+            if msg_id:
+                # Launch approval polling in background thread so monitor loop continues
+                PENDING_DISCORD_APPROVALS[ticker] = True
+                PENDING_CLOSE_UNTIL[close_key] = time.time() + DISCORD_APPROVAL_TIMEOUT_SECONDS + 5
+                def _run_approval(t=ticker, d=direction, c=contracts, ep=entry_price,
+                                  ef=entry_fees, tr=trigger, er=exit_reason, mid=msg_id, ck=close_key):
+                    try:
+                        result = discord_bot.wait_for_approval(mid)
+                        if result == "approved":
+                            logger.info(f"[EXIT] APPROVED by user: {t} | {tr}")
+                            _execute_exit(t, d, c, ep, ef, tr, er, ck)
+                        else:
+                            logger.info(f"[EXIT] {'REJECTED by user' if result == 'rejected' else 'NO RESPONSE (timeout)'} — holding: {t} | {tr}")
+                            STOP_LOSS_CONSECUTIVE_HITS.pop(t, None)
+                            TRAILING_TP_CONSECUTIVE_HITS.pop(t, None)
+                            PENDING_CLOSE_UNTIL.pop(ck, None)
+                    except Exception as e:
+                        logger.error(f"[EXIT] Discord approval thread error for {t}: {e}")
+                        PENDING_CLOSE_UNTIL.pop(ck, None)
+                    finally:
+                        PENDING_DISCORD_APPROVALS.pop(t, None)
+                threading.Thread(target=_run_approval, daemon=True).start()
                 continue
 
-            # Fetch actual fill price and fees from exchange
-            sell_side = "yes" if direction == "YES" else "no"
-            kalshi_order_id = order_data.get('order_id')
-            actual_exit_price, exit_fees = fetch_fill_price_and_fees(kalshi_order_id, sell_side) if kalshi_order_id else (None, 0.0)
-
-            if actual_exit_price is not None:
-                exit_price = actual_exit_price
-                logger.info(f"Actual exit fill price for {ticker}: ${exit_price:.4f} (fees: ${exit_fees:.2f})")
-            else:
-                exit_price = fresh_quote["bid"]
-                exit_fees = 0.0
-                logger.warning(f"Could not fetch exit fills for {ticker}, using quote price ${exit_price:.4f}")
-
-            realized_pnl = contracts * (exit_price - entry_price) - entry_fees - exit_fees
-            realized_pnl_pct = ((exit_price - entry_price) / entry_price * 100.0) if entry_price > 0 else 0.0
-
-            logger.success(
-                f"[EXIT] CLOSED: {ticker} | trigger={trigger} | dir={direction} | contracts={contracts} | "
-                f"entry=${entry_price:.4f} | exit=${exit_price:.4f} | fees=${entry_fees + exit_fees:.2f} | "
-                f"pnl=${realized_pnl:.2f} ({realized_pnl_pct:.2f}%) | order={json.dumps(order_body)}"
-            )
-
-            # Mark all OPEN fills in DB as CLOSED with realized P&L
-            rows_closed = mark_fills_closed(cursor, ticker, exit_price, trigger)
-            conn.commit()
-            logger.info(f"Marked {rows_closed} OPEN fill(s) as CLOSED for {ticker} at exit={exit_price:.4f}")
-
-            # Clean trailing marks for closed position
-            TRAILING_HIGH.pop(ticker, None)
-            STOP_LOSS_CONSECUTIVE_HITS.pop(ticker, None)
-            TRAILING_TP_CONSECUTIVE_HITS.pop(ticker, None)
-            _delete_trailing_mark(conn, ticker)
-
-            # Alert if loss exceeds -20% (severe loss on binary contract)
-            if trigger == "stop_loss" and realized_pnl_pct < -20.0:
-                logger.error(f"ALERT: Close order for {ticker} executed with severe loss {realized_pnl_pct:.2f}%")
-
-            notify_position_closed_async(
-                ticker=ticker,
-                direction=direction,
-                quantity=contracts,
-                entry_price=entry_price,
-                exit_price=exit_price,
-                pnl_dollars=realized_pnl,
-                pnl_percent=realized_pnl_pct,
-                trigger=trigger,
-                order_status=order_status,
-                entry_fees=entry_fees,
-                exit_fees=exit_fees,
-            )
-        except Exception as close_err:
-            # Allow immediate retry next loop if the close request itself failed.
-            PENDING_CLOSE_UNTIL.pop(close_key, None)
-            response = getattr(close_err, 'response', None)
-            status_code = getattr(response, 'status_code', 'unknown')
-            response_body = (getattr(response, 'text', '') or '')[:1000]
-            logger.error(
-                f"Close order failed for {ticker}: {close_err} | status={status_code} | body={response_body or 'N/A'}"
-            )
+        _execute_exit(ticker, direction, contracts, entry_price, entry_fees, trigger, exit_reason, close_key)
 
     conn.close()
 
@@ -1401,6 +1458,11 @@ def monitor_positions():
         time.sleep(MONITOR_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
+    # Pre-cache Discord bot user ID to avoid latency on first approval
+    if DISCORD_INTERACTIVE_SL_TP and discord_bot.is_configured():
+        discord_bot._get_bot_user_id()
+        logger.info(f"[DISCORD_BOT] Pre-cached bot user ID: {discord_bot._BOT_USER_ID}")
+
     # Fetch all tickers to monitor (from open positions at startup)
     try:
         initial_positions = get_current_positions()
