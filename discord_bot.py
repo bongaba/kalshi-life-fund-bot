@@ -325,7 +325,7 @@ def _send_message(content: str):
             f"{DISCORD_API_BASE}/channels/{DISCORD_CHANNEL_ID}/messages",
             headers=_headers(),
             json={"content": content},
-            timeout=10,
+            timeout=3,
         )
     except Exception as e:
         logger.warning(f"[DISCORD_CMD] Failed to send message: {e}")
@@ -410,17 +410,20 @@ def _poll_commands():
     global _LAST_PROCESSED_MSG_ID
     bot_user_id = _get_bot_user_id()
 
+    # Persistent session for connection reuse (avoids TLS handshake each poll)
+    session = requests.Session()
+    session.headers.update(_headers())
+
     while _COMMAND_LISTENER_RUNNING:
         try:
             params = {"limit": 5}
             if _LAST_PROCESSED_MSG_ID:
                 params["after"] = _LAST_PROCESSED_MSG_ID
 
-            resp = requests.get(
+            resp = session.get(
                 f"{DISCORD_API_BASE}/channels/{DISCORD_CHANNEL_ID}/messages",
-                headers=_headers(),
                 params=params,
-                timeout=10,
+                timeout=3,
             )
             if resp.status_code != 200:
                 time.sleep(_COMMAND_POLL_INTERVAL)
