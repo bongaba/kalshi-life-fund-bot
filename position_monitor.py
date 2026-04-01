@@ -1397,7 +1397,8 @@ def monitor_positions_once():
         )
 
         # --- Interactive Discord approval (non-blocking) ---
-        if DISCORD_INTERACTIVE_SL_TP and discord_bot.is_configured() and not severe_breach:
+        # ALL exits require user approval — no automatic execution
+        if DISCORD_INTERACTIVE_SL_TP and discord_bot.is_configured():
             # If this ticker is already pending approval, skip (don't double-send)
             if ticker in PENDING_DISCORD_APPROVALS:
                 logger.debug(f"[EXIT] Already pending Discord approval for {ticker}, skipping")
@@ -1437,6 +1438,9 @@ def monitor_positions_once():
                     finally:
                         PENDING_DISCORD_APPROVALS.pop(t, None)
                 threading.Thread(target=_run_approval, daemon=True).start()
+                continue
+            else:
+                logger.error(f"[EXIT] BLOCKED: Discord approval request failed to send for {ticker} — will NOT auto-execute. Retrying next cycle.")
                 continue
 
         _execute_exit(ticker, direction, contracts, entry_price, entry_fees, trigger, exit_reason, close_key)
