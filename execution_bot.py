@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from config import *
 from decision_engine import should_trade
 from discord_notifications import notify_trade_executed, notify_error, notify_startup, notify_cycle_summary, notify_account_balance
+import discord_bot
 import winsound
 
 setup_log_file("bot.log")
@@ -636,6 +637,11 @@ def fetch_closed_markets(days=7, max_pages=CLOSED_MARKETS_MAX_PAGES):
 def main_loop():
     global daily_loss, daily_trade_count
     try:
+        # Check Discord remote pause flag
+        if discord_bot.is_paused("execution"):
+            logger.info("[BOT CYCLE] Execution bot is PAUSED via Discord — skipping cycle")
+            return
+
         logger.info(
             f"[BOT CYCLE] Decision mode={get_decision_mode_label()} | use_grok={USE_GROK} | "
             f"override_internal_model_with_grok={OVERRIDE_INTERNAL_MODEL_WITH_GROK} | "
@@ -943,6 +949,9 @@ logger.info("🚀 Kalshi Execution Bot started – Official Kalshi example signi
 logger.info(f"[BOT START] LOOP_SCHEDULE: {BOT_LOOP_SCHEDULE}")
 logger.info(f"[BOT START] RUN_MODE: {BOT_RUN_MODE}")
 logger.info(f"[BOT START] DECISION_MODE: {get_decision_mode_label()}")
+
+# Start Discord command listener for remote control
+discord_bot.start_command_listener()
 
 if BOT_RUN_MODE == "single_run":
     logger.info("[BOT START] Single-run mode active | executing one cycle and exiting")

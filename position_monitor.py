@@ -1141,6 +1141,11 @@ def _execute_exit(ticker, direction, contracts, entry_price, entry_fees, trigger
 
 def monitor_positions_once():
     """Monitor live positions and submit IOC close orders at configured P&L % thresholds."""
+    # Check Discord remote pause flag
+    if discord_bot.is_paused("monitor"):
+        logger.info("[MONITOR] Position monitor is PAUSED via Discord — skipping cycle")
+        return
+
     logger.info("Checking open positions for take-profit/stop-loss exits...")
 
     positions = get_current_positions()
@@ -1462,6 +1467,9 @@ def monitor_positions():
         time.sleep(MONITOR_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
+    # Start Discord command listener for remote control (silent — execution_bot sends replies)
+    discord_bot.start_command_listener(respond=False)
+
     # Pre-cache Discord bot user ID to avoid latency on first approval
     if DISCORD_INTERACTIVE_SL_TP and discord_bot.is_configured():
         discord_bot._get_bot_user_id()

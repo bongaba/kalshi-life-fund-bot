@@ -1,10 +1,13 @@
-"""Interactive Discord bot for SL/TP approval via reactions.
+"""Interactive Discord bot for SL/TP approval via reactions and remote control commands.
 
 Uses Discord REST API directly (no discord.py dependency).
 Sends embed messages with ✅/❌ reactions, polls for user response.
+Supports text commands (!pause, !resume, !status) for remote bot control.
 """
 
+import os
 import time
+import threading
 import requests
 from loguru import logger
 from config import (
@@ -282,3 +285,207 @@ def send_exit_result(
         )
     except Exception as e:
         logger.warning(f"[DISCORD_BOT] Failed to send exit result: {e}")
+
+
+# =============================================================================
+# Remote control: pause / resume / status via Discord text commands
+# =============================================================================
+
+# Pause flags — checked by execution_bot and position_monitor each cycle
+_PAUSE_FLAGS = {
+    "execution": False,
+    "monitor": False,
+}
+_PAUSE_LOCK = threading.Lock()
+
+# Track the last message ID we've processed so we don't replay old commands
+_LAST_PROCESSED_MSG_ID = None
+_COMMAND_POLL_INTERVAL = 0.5  # seconds — fast polling for responsive commands
+_COMMAND_LISTENER_RUNNING = False
+_RESPOND = True  # only one process should send replies to avoid duplicates
+
+
+def is_paused(component: str) -> bool:
+    """Check if a component is paused. component = 'execution' or 'monitor'."""
+    with _PAUSE_LOCK:
+        return _PAUSE_FLAGS.get(component, False)
+
+
+def _set_pause(component: str, paused: bool):
+    with _PAUSE_LOCK:
+        _PAUSE_FLAGS[component] = paused
+
+
+def _send_message(content: str):
+    """Send a plain text message to the configured channel."""
+    if not is_configured():
+        return
+    try:
+        requests.post(
+            f"{DISCORD_API_BASE}/channels/{DISCORD_CHANNEL_ID}/messages",
+            headers=_headers(),
+            json={"content": content},
+            timeout=10,
+        )
+    except Exception as e:
+        logger.warning(f"[DISCORD_CMD] Failed to send message: {e}")
+
+
+def _handle_command(text: str):
+    """Parse and execute a bot command. Returns True if it was a recognized command."""
+    text = text.strip().lower()
+    if not text.startswith("!"):
+        return False
+
+    parts = text.split()
+    cmd = parts[0]
+    arg = parts[1] if len(parts) > 1 else ""
+
+    def _reply(msg):
+        """Send a reply only if this listener is the primary (non-silent) one."""
+        if _RESPOND:
+            _send_message(msg)
+
+    if cmd == "!pause":
+        if arg in ("execution", "bot"):
+            _set_pause("execution", True)
+            _reply("⏸️ **Execution bot PAUSED** — no new trades will be placed. Use `!resume execution` to restart.")
+            logger.warning("[DISCORD_CMD] Execution bot PAUSED by user")
+            return True
+        elif arg == "monitor":
+            _set_pause("monitor", True)
+            _reply("⏸️ **Position monitor PAUSED** — no exit checks will run. Use `!resume monitor` to restart.")
+            logger.warning("[DISCORD_CMD] Position monitor PAUSED by user")
+            return True
+        elif arg == "all" or arg == "":
+            _set_pause("execution", True)
+            _set_pause("monitor", True)
+            _reply("⏸️ **ALL bots PAUSED** — no trades or exit checks. Use `!resume all` to restart.")
+            logger.warning("[DISCORD_CMD] ALL bots PAUSED by user")
+            return True
+
+    elif cmd == "!resume":
+        if arg in ("execution", "bot"):
+            _set_pause("execution", False)
+            _reply("▶️ **Execution bot RESUMED** — trading is active.")
+            logger.info("[DISCORD_CMD] Execution bot RESUMED by user")
+            return True
+        elif arg == "monitor":
+            _set_pause("monitor", False)
+            _reply("▶️ **Position monitor RESUMED** — exit monitoring active.")
+            logger.info("[DISCORD_CMD] Position monitor RESUMED by user")
+            return True
+        elif arg == "all" or arg == "":
+            _set_pause("execution", False)
+            _set_pause("monitor", False)
+            _reply("▶️ **ALL bots RESUMED** — trading and monitoring active.")
+            logger.info("[DISCORD_CMD] ALL bots RESUMED by user")
+            return True
+
+    elif cmd == "!status":
+        with _PAUSE_LOCK:
+            exec_status = "⏸️ PAUSED" if _PAUSE_FLAGS["execution"] else "▶️ RUNNING"
+            mon_status = "⏸️ PAUSED" if _PAUSE_FLAGS["monitor"] else "▶️ RUNNING"
+        _reply(f"**Bot Status**\nExecution bot: {exec_status}\nPosition monitor: {mon_status}")
+        return True
+
+    elif cmd == "!help":
+        _reply(
+            "**Available commands:**\n"
+            "`!pause execution` — pause trade execution\n"
+            "`!pause monitor` — pause position monitor\n"
+            "`!pause all` — pause everything\n"
+            "`!resume execution` — resume trade execution\n"
+            "`!resume monitor` — resume position monitor\n"
+            "`!resume all` — resume everything\n"
+            "`!status` — show current bot status"
+        )
+        return True
+
+    return False
+
+
+def _poll_commands():
+    """Background thread: poll Discord channel for new text commands."""
+    global _LAST_PROCESSED_MSG_ID
+    bot_user_id = _get_bot_user_id()
+
+    while _COMMAND_LISTENER_RUNNING:
+        try:
+            params = {"limit": 5}
+            if _LAST_PROCESSED_MSG_ID:
+                params["after"] = _LAST_PROCESSED_MSG_ID
+
+            resp = requests.get(
+                f"{DISCORD_API_BASE}/channels/{DISCORD_CHANNEL_ID}/messages",
+                headers=_headers(),
+                params=params,
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                time.sleep(_COMMAND_POLL_INTERVAL)
+                continue
+
+            messages = resp.json()
+            if not messages:
+                time.sleep(_COMMAND_POLL_INTERVAL)
+                continue
+
+            # Messages come newest-first; process oldest-first
+            messages.sort(key=lambda m: m["id"])
+
+            for msg in messages:
+                msg_id = msg["id"]
+                author_id = msg.get("author", {}).get("id")
+
+                # Skip messages from the bot itself
+                if author_id == bot_user_id:
+                    _LAST_PROCESSED_MSG_ID = msg_id
+                    continue
+
+                content = msg.get("content", "")
+                if content.startswith("!"):
+                    _handle_command(content)
+
+                _LAST_PROCESSED_MSG_ID = msg_id
+
+        except Exception as e:
+            logger.debug(f"[DISCORD_CMD] Poll error: {e}")
+
+        time.sleep(_COMMAND_POLL_INTERVAL)
+
+
+def start_command_listener(respond=True):
+    """Start the background command listener thread. Safe to call multiple times.
+
+    Args:
+        respond: If True, this listener sends reply messages to Discord.
+                 Set False for secondary processes to avoid duplicate messages.
+    """
+    global _COMMAND_LISTENER_RUNNING, _LAST_PROCESSED_MSG_ID, _RESPOND
+    _RESPOND = respond
+    if _COMMAND_LISTENER_RUNNING:
+        return
+    if not is_configured():
+        logger.debug("[DISCORD_CMD] Not configured, skipping command listener")
+        return
+
+    # Seed _LAST_PROCESSED_MSG_ID to the latest message so we don't replay history
+    try:
+        resp = requests.get(
+            f"{DISCORD_API_BASE}/channels/{DISCORD_CHANNEL_ID}/messages",
+            headers=_headers(),
+            params={"limit": 1},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            messages = resp.json()
+            if messages:
+                _LAST_PROCESSED_MSG_ID = messages[0]["id"]
+    except Exception:
+        pass
+
+    _COMMAND_LISTENER_RUNNING = True
+    thread = threading.Thread(target=_poll_commands, daemon=True, name="discord-cmd-listener")
+    thread.start()
+    logger.info("[DISCORD_CMD] Command listener started — send !help in Discord for commands")

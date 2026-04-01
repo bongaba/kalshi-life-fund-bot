@@ -14,45 +14,42 @@ To add a new category:
 
 
 def prompt_btc(market_title, description, yes_price, no_price, hours_to_close):
-    return f"""You are in strict Bitcoin-only mode for short-term Kalshi markets. Think like a high-frequency crypto trader with perfect tool access.
+    return f"""You are in strict Bitcoin-only mode for short-term Kalshi markets. Think like a high-frequency crypto trader.
 
-CRITICAL INSTRUCTIONS — FOLLOW EXACTLY AND IN THIS ORDER:
+CRITICAL INSTRUCTIONS — FOLLOW EXACTLY:
 
-1. Before any reasoning, you MUST use the browse_page tool on these sources in exact priority order. For every call, explicitly instruct the tool to extract: current BTC price + exact timestamp / "last updated" time.
+1. Before any reasoning, use the browse_page tool on these sources and extract current BTC price + exact timestamp:
 
    Priority:
-   - https://www.cfbenchmarks.com/data/indices/BRTI          ← Official Kalshi settlement index (reference only)
+   - https://www.cfbenchmarks.com/data/indices/BRTI          ← settlement reference only
    - https://www.coingecko.com/en/coins/bitcoin
    - https://finance.yahoo.com/quote/BTC-USD
    - https://www.coinbase.com/price/bitcoin
 
-2. FRESHNESS RULE (STRICT BUT PRACTICAL):
-   - All price data should ideally be < 3 minutes old.
-   - When < 30 minutes to close: accept data up to 8 minutes old if at least two sources show consistent direction and momentum.
-   - When < 10 minutes to close: accept data up to 10 minutes old if the sources agree on direction.
-   - BRTI is often stale — treat it only as a loose reference. Never overweight or rely heavily on BRTI.
-   - If you cannot get reasonably fresh data from at least two sources, output HOLD.
+2. FRESHNESS RULE (PRACTICAL):
+   - Prefer data < 3 min old.
+   - < 30 min to close: accept up to 8 min old if ≥2 sources agree on direction.
+   - < 10 min to close: accept up to 10 min old if momentum is clear.
+   - BRTI is often stale — treat it only as a loose reference.
+   - If fewer than two reasonably fresh sources, output HOLD.
 
-3. Kalshi settles on the trimmed 60-second average of the BRTI index at the exact resolution time ({hours_to_close:.1f} hours from now). However, your prediction should be driven primarily by the freshest real-time prices and immediate momentum.
+3. Kalshi settles on BRTI at resolution ({hours_to_close:.1f} hours from now).
 
-4. You MUST also check current Bitcoin sentiment using x_keyword_search or x_semantic_search for posts from the last 5 minutes.
+   MARKET TITLE: {market_title}
+   MARKET DESCRIPTION: {description}
+   Current YES price: {yes_price} | NO price: {no_price}
 
-5. Pay very close attention to "Hours until close":
-   - < 30 minutes left → rely **exclusively** on the freshest real-time sources (CoinGecko, Yahoo Finance, Coinbase). Ignore or heavily discount BRTI if it is older than 5 minutes. Base your decision on live market consensus.
-   - < 10 minutes left → use the most recent live sources available. Focus on immediate price + order flow momentum.
-   - ≥ 30 minutes left → use consensus of the freshest sources + short-term trend and catalysts (BRTI may be used only as a loose reference)
+4. Check recent X sentiment (last 5 minutes).
 
-6. Analyze:
-   - Consensus price from fresh sources vs any strike or current price direction
-   - Edge compared to current YES/NO share prices
-   - Recent momentum (last 1-10 min)
-   - Real-time X sentiment
-   - Any breaking news or macro catalysts
+5. Hours until close:
+   - < 30 min → focus on live consensus price + immediate momentum.
+   - < 10 min → be decisive using the strongest live sources.
+   - ≥ 30 min → balance fresh price with short-term trend.
 
-7. Only output YES or NO if you have fresh consensus data from multiple live sources AND genuine 85%+ confidence in the direction. Otherwise output HOLD. On very short timeframes (<15 minutes), be willing to take a 75-85% confident call if the live price and momentum strongly support the direction.
+6. Only output YES or NO if you have clear directional edge and ≥ 85% confidence (≥ 78% if <15 min left). Otherwise HOLD.
 
-Output ONLY valid JSON. No other text whatsoever:
-{{"direction": "YES" or "NO" or "HOLD", "confidence": integer 0-100, "reason": "1 short BTC Price, ALL source prices + exact timestamps, consensus price, and key driver"}}"""
+Output ONLY valid JSON:
+{{"direction": "YES" or "NO" or "HOLD", "confidence": integer 0-100, "reason": "short summary with all source prices + timestamps, consensus, and key driver"}}"""
 
 
 def prompt_weather(market_title, description, yes_price, no_price, hours_to_close):
