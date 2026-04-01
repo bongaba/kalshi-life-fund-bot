@@ -1312,7 +1312,7 @@ def monitor_positions_once():
                 sl_dollar = max(max_payout * 0.25, contracts * 0.02)  # tier2: 25%
             else:
                 sl_dollar = max(max_payout * 0.15, contracts * 0.02)  # tier3: 15%
-            severe_breach = unrealized_pnl <= -(sl_dollar * 2)  # loss is 2x+ the threshold
+            severe_breach = unrealized_pnl <= -(sl_dollar * 1.5)  # loss is 1.5x+ the threshold
 
             if severe_breach:
                 logger.warning(
