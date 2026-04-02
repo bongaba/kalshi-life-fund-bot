@@ -782,12 +782,22 @@ def main_loop():
 
                 side = "yes" if decision["direction"] == "YES" else "no"
                 action = "buy"
-                contract_price = yes_price if side == "yes" else no_price
 
-                limit_price_cents = int(contract_price * 100)
+                # Use the ASK price (what sellers are offering) so IOC orders
+                # actually match resting liquidity.  Fall back to midpoint if
+                # no ask is available, and add 1¢ slippage to handle tiny
+                # orderbook movements between quote and order submission.
+                if side == "yes":
+                    contract_price = price_data.get('yes_ask') or yes_price
+                else:
+                    contract_price = price_data.get('no_ask') or no_price
+
+                SLIPPAGE_CENTS = 1  # 1¢ slippage tolerance
+                limit_price_cents = int(contract_price * 100) + SLIPPAGE_CENTS
+                limit_price_dollars = limit_price_cents / 100.0
                 # Number of contracts to buy, derived from the size computed in the decision engine.
                 count = int(decision["size"] * 100)
-                total_order_cost = count * contract_price
+                total_order_cost = count * limit_price_dollars
 
                 client_order_id = f"life-fund-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
 
