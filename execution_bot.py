@@ -143,6 +143,7 @@ def ensure_trade_table_columns():
         'order_status': 'TEXT',
         'resolved_timestamp': 'TEXT',
         'fees': 'REAL DEFAULT 0',
+        'event_ticker': 'TEXT',
     }
 
     for column_name, column_type in required_columns.items():
@@ -723,6 +724,19 @@ def main_loop():
         decided_to_trade = 0
         cycle_total_order_cost = 0.0
 
+        # Load per-event trade counts to enforce MAX_TRADES_PER_EVENT
+        MAX_TRADES_PER_EVENT = 2
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT event_ticker, COUNT(*) FROM trades "
+            "WHERE event_ticker IS NOT NULL AND status != 'CANCELED' "
+            "GROUP BY event_ticker HAVING COUNT(*) >= ?",
+            (MAX_TRADES_PER_EVENT,),
+        )
+        saturated_events = {row[0] for row in cursor.fetchall()}
+        # Also track events traded this cycle (in case multiple markets from same event appear)
+        cycle_event_trades = {}  # event_ticker -> count this cycle
+
         for market in markets:
             ticker = market.get('ticker')
             if not ticker:
@@ -732,7 +746,23 @@ def main_loop():
                 logger.info(f"   → Skipping {ticker}: multivariate/combo market without reliable binary pricing")
                 continue
 
-            title = market.get('title') or market.get('event_ticker', 'Unknown')
+            event_ticker = market.get('event_ticker') or ''
+            title = market.get('title') or event_ticker or 'Unknown'
+
+            # Skip if this event already has MAX_TRADES_PER_EVENT trades (DB + this cycle)
+            if event_ticker:
+                db_count = 0
+                if event_ticker in saturated_events:
+                    db_count = MAX_TRADES_PER_EVENT
+                else:
+                    db_count = cursor.execute(
+                        "SELECT COUNT(*) FROM trades WHERE event_ticker = ? AND status != 'CANCELED'",
+                        (event_ticker,),
+                    ).fetchone()[0]
+                total_count = db_count + cycle_event_trades.get(event_ticker, 0)
+                if total_count >= MAX_TRADES_PER_EVENT:
+                    logger.info(f"   → Skipping {ticker}: event {event_ticker} already has {total_count} trade(s) (limit={MAX_TRADES_PER_EVENT})")
+                    continue
 
             price_data = get_market_prices(market)
             yes_price = price_data['yes_price']
@@ -893,9 +923,10 @@ def main_loop():
                                 client_order_id,
                                 kalshi_order_id,
                                 order_status,
-                                fees
+                                fees,
+                                event_ticker
                             )
-                            VALUES (datetime('now'), ?, ?, ?, ?, 0.0, ?, 'OPEN', ?, ?, ?, ?)
+                            VALUES (datetime('now'), ?, ?, ?, ?, 0.0, ?, 'OPEN', ?, ?, ?, ?, ?)
                         ''', (
                             ticker,
                             decision['direction'],
@@ -906,8 +937,13 @@ def main_loop():
                             kalshi_order_id,
                             order_status,
                             entry_fees,
+                            event_ticker,
                         ))
                         conn.commit()
+
+                        # Track event trades this cycle
+                        if event_ticker:
+                            cycle_event_trades[event_ticker] = cycle_event_trades.get(event_ticker, 0) + 1
 
                         cycle_total_order_cost += total_order_cost
                         daily_trade_count += 1
