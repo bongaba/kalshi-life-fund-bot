@@ -5,6 +5,7 @@ import requests
 import uuid
 import base64
 import json
+import threading
 from datetime import datetime, timezone
 from loguru import logger
 from logging_setup import setup_log_file, setup_error_log, setup_trade_decision_log
@@ -156,11 +157,13 @@ ensure_trade_table_columns()
 
 daily_loss = 0.0
 daily_trade_count = 0
+_DAILY_LOCK = threading.Lock()
 
 def daily_pnl_reset():
     global daily_loss, daily_trade_count
-    daily_loss = 0.0
-    daily_trade_count = 0
+    with _DAILY_LOCK:
+        daily_loss = 0.0
+        daily_trade_count = 0
     logger.info("Daily loss limit reset")
 
 schedule.every().day.at("00:00").do(daily_pnl_reset)
@@ -365,7 +368,7 @@ def update_resolved_trades():
 
             settled_timestamp = normalize_settled_timestamp(settlement.get('settled_time'))
             if settled_timestamp is None:
-                settled_timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                settled_timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
             logger.info(
                 f"Settlement {ticker}: {winner} won | market_result={settlement.get('market_result')} | "
@@ -433,18 +436,19 @@ def signed_request(method, path, params=None, body=None):
     signature = create_signature(private_key, timestamp, method.upper(), sign_path)
 
     headers = {
-        "Content-Type": "application/json" if body else None,
         "KALSHI-ACCESS-KEY": KALSHI_API_KEY_ID,
         "KALSHI-ACCESS-SIGNATURE": signature,
         "KALSHI-ACCESS-TIMESTAMP": timestamp,
     }
+    if body:
+        headers["Content-Type"] = "application/json"
 
     url = f"{host}{full_path}"
 
     if method.upper() == "GET":
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=10)
     elif method.upper() == "POST":
-        response = requests.post(url, headers=headers, json=body)
+        response = requests.post(url, headers=headers, json=body, timeout=10)
     else:
         raise ValueError(f"Unsupported method: {method}")
 
@@ -584,10 +588,10 @@ def fetch_soon_closing_markets(hours=MARKET_SCAN_HOURS, max_pages=OPEN_MARKETS_M
         try:
             data = signed_request("GET", "/markets", params=params)
         except requests.exceptions.HTTPError as e:
-            if e.response and e.response.status_code == 429:
-                logger.warning("Rate limit hit — sleeping 60s")
+            if e.response is not None and e.response.status_code == 429:
+                logger.warning("Rate limit hit fetching open markets — sleeping 60s then retrying")
                 time.sleep(60)
-                break
+                continue  # retry same page
             raise
         markets_page = data.get('markets', [])
         all_markets.extend(markets_page)
@@ -620,10 +624,10 @@ def fetch_closed_markets(days=7, max_pages=CLOSED_MARKETS_MAX_PAGES):
         try:
             data = signed_request("GET", "/markets", params=params)
         except requests.exceptions.HTTPError as e:
-            if e.response and e.response.status_code == 429:
-                logger.warning("Rate limit hit — sleeping 60s")
+            if e.response is not None and e.response.status_code == 429:
+                logger.warning("Rate limit hit fetching settled markets — sleeping 60s then retrying")
                 time.sleep(60)
-                break
+                continue  # retry same page
             raise
         markets_page = data.get('markets', [])
         all_markets.extend(markets_page)
@@ -906,8 +910,6 @@ def main_loop():
                             order_status=order_status,
                             fees=entry_fees,
                         )
-
-                        update_trade_status(ticker, 'OPEN')
 
                         cursor = conn.cursor()
                         cursor.execute('''

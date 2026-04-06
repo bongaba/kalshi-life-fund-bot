@@ -155,11 +155,10 @@ def wait_for_approval(message_id: str, timeout: int = None) -> str:
     timeout = timeout or DISCORD_APPROVAL_TIMEOUT_SECONDS
     bot_user_id = _get_bot_user_id()
     poll_interval = 0.5  # seconds — fast polling for low latency
-    elapsed = 0
+    deadline = time.monotonic() + timeout
 
-    while elapsed < timeout:
+    while time.monotonic() < deadline:
         time.sleep(poll_interval)
-        elapsed += poll_interval
 
         try:
             # Check ✅ reactions

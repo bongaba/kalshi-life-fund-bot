@@ -14,6 +14,7 @@ st.title("💰 Kalshi Life-Saving Fund Dashboard")
 
 conn = sqlite3.connect('trades.db')
 df = pd.read_sql_query("SELECT * FROM trades", conn)
+conn.close()
 
 if df.empty:
     st.info("No trades yet. Bot is running in background.")
@@ -39,8 +40,9 @@ st.info(f"Pending/Open: {pending} trades")
 
 # Chart
 if 'pnl' in df.columns and df['pnl'].sum() != 0:
-    cumulative = df['pnl'].cumsum()
-    fig = px.line(x=df['timestamp'], y=cumulative, title="Cumulative P&L")
+    df_sorted = df.sort_values('timestamp', ascending=True)
+    cumulative = df_sorted['pnl'].cumsum()
+    fig = px.line(x=df_sorted['timestamp'], y=cumulative, title="Cumulative P&L")
     st.plotly_chart(fig, use_container_width=True)
 
 # Table

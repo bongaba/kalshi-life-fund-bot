@@ -23,7 +23,10 @@ def get_realtime_executable_quote(ticker, direction):
         }
 
     # Try WebSocket cache first (primary source)
-    q = REALTIME_QUOTES.get(ticker)
+    with _BOOK_LOCK:
+        q = REALTIME_QUOTES.get(ticker)
+        if q:
+            q = dict(q)  # shallow copy for thread safety
     if q:
         age = (datetime.now(timezone.utc) - q["timestamp"]).total_seconds()
         if age <= WS_QUOTE_FRESHNESS_SECONDS:
@@ -55,15 +58,16 @@ def get_realtime_executable_quote(ticker, direction):
         timestamp = datetime.now(timezone.utc)
 
         # Seed the WS orderbook so deltas can build on it
-        WS_ORDERBOOKS[ticker] = {
-            "yes": {float(p): float(s) for p, s in yes_orders} if yes_orders else {},
-            "no": {float(p): float(s) for p, s in no_orders} if no_orders else {},
-        }
-        REALTIME_QUOTES[ticker] = {
-            "yes_dollars": yes_orders,
-            "no_dollars": no_orders,
-            "timestamp": timestamp
-        }
+        with _BOOK_LOCK:
+            WS_ORDERBOOKS[ticker] = {
+                "yes": {float(p): float(s) for p, s in yes_orders} if yes_orders else {},
+                "no": {float(p): float(s) for p, s in no_orders} if no_orders else {},
+            }
+            REALTIME_QUOTES[ticker] = {
+                "yes_dollars": yes_orders,
+                "no_dollars": no_orders,
+                "timestamp": timestamp
+            }
 
         if direction == "YES":
             result = _extract_best_bid(yes_orders)
@@ -105,74 +109,18 @@ setup_log_file("monitor.log")
 setup_error_log()
 setup_trade_decision_log()
 
-TAKE_PROFIT_PERCENT = POSITION_TAKE_PROFIT_PERCENT
-STOP_LOSS_PERCENT = POSITION_STOP_LOSS_PERCENT
 MONITOR_INTERVAL_SECONDS = POSITION_MONITOR_INTERVAL_SECONDS
 POSITION_CLOSE_COOLDOWN_SECONDS = max(10, MONITOR_INTERVAL_SECONDS * 2)
-QUOTE_FRESHNESS_SECONDS = QUOTE_FRESHNESS_SECONDS  # loaded from config.py
 
 # Real-time quote cache (ticker -> latest orderbook dict)
 REALTIME_QUOTES = {}
 
-# Trailing high water mark for take-profit (both YES and NO positions)
-# Since current_price is always the bid for the position's side,
-# profit = current_price - entry_price for both directions.
-TRAILING_HIGH = {}   # ticker -> highest bid seen (peak profit point)
-_TRAILING_MARKS_LOADED = False  # flag so we only load from DB once per process
+# Lock for global state accessed by both the monitor loop and daemon exit threads
+_STATE_LOCK = threading.Lock()
 
 # Stop-loss confirmation: require N consecutive breaches before executing
 STOP_LOSS_CONFIRMATIONS_REQUIRED = 3
 STOP_LOSS_CONSECUTIVE_HITS = {}  # ticker -> consecutive breach count
-
-# Trailing TP confirmation: base requirement, scales up when deep in profit
-TRAILING_TP_CONFIRMATIONS_BASE = 2
-TRAILING_TP_CONFIRMATIONS_DEEP_PROFIT = 3  # when ≥30% of max profit realized
-TRAILING_TP_CONSECUTIVE_HITS = {}  # ticker -> consecutive breach count
-
-# Only activate trailing TP once profit exceeds this fraction of max_payout
-TRAILING_TP_ACTIVATION_PCT = 0.10  # 10% of max_payout
-
-
-def _ensure_trailing_marks_table(conn):
-    """Create the trailing_marks table if it doesn't exist."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS trailing_marks (
-            ticker TEXT PRIMARY KEY,
-            direction TEXT NOT NULL,
-            mark_value REAL NOT NULL
-        )
-    """)
-    conn.commit()
-
-
-def _load_trailing_marks_from_db(conn):
-    """Load persisted trailing marks into in-memory dicts (once per process)."""
-    global _TRAILING_MARKS_LOADED
-    if _TRAILING_MARKS_LOADED:
-        return
-    _ensure_trailing_marks_table(conn)
-    rows = conn.execute("SELECT ticker, direction, mark_value FROM trailing_marks").fetchall()
-    for ticker, direction, mark_value in rows:
-        TRAILING_HIGH[ticker] = mark_value
-    if rows:
-        logger.info(f"Loaded {len(rows)} trailing mark(s) from DB")
-    _TRAILING_MARKS_LOADED = True
-
-
-def _save_trailing_mark(conn, ticker, direction, mark_value):
-    """Upsert a trailing mark to the DB."""
-    conn.execute(
-        "INSERT INTO trailing_marks (ticker, direction, mark_value) VALUES (?, ?, ?) "
-        "ON CONFLICT(ticker) DO UPDATE SET mark_value = excluded.mark_value",
-        (ticker, direction, mark_value),
-    )
-    conn.commit()
-
-
-def _delete_trailing_mark(conn, ticker):
-    """Remove a trailing mark from the DB."""
-    conn.execute("DELETE FROM trailing_marks WHERE ticker = ?", (ticker,))
-    conn.commit()
 
 
 def compute_smart_exit(entry_price, current_price, direction, seconds_to_close, market_duration_seconds=None, fee_per_contract=0.0, contracts=1):
@@ -181,14 +129,7 @@ def compute_smart_exit(entry_price, current_price, direction, seconds_to_close, 
     Binary contracts settle at $1.00 (win) or $0.00 (lose).
     Returns (should_exit, trigger, reason) tuple.
 
-    3-Tier Stop-Loss System:
-      Tier | Entry Range   | Rule                    | Price Drop to Trigger
-      -----+---------------+-------------------------+----------------------
-        1  | >= $0.82      | Absolute 15¢ below entry| 15¢/contract
-        2  | $0.75 – $0.81 | 25% of max_payout       | ~5-6¢/contract
-        3  | < $0.75       | 15% of max_payout       | Tight protection
-
-    Trailing take-profit is handled separately by check_trailing_take_profit().
+    Stop-loss: triggers when position loses 50%+ of original entry value.
     """
     # --- Max payout: total possible profit if contract settles at $1.00 ---
     total_fees = fee_per_contract * contracts
@@ -199,134 +140,22 @@ def compute_smart_exit(entry_price, current_price, direction, seconds_to_close, 
     # so profit = current - entry for both directions.
     unrealized_pnl = contracts * (current_price - entry_price) - total_fees
 
-    # --- 3-tier stop-loss system ---
-    # Tier 1 (≥$0.82): absolute 15¢ floor — high confidence, max noise protection
-    # Tier 2 ($0.75–$0.81): 25% of max_payout — moderate breathing room
-    # Tier 3 (<$0.75): 15% of max_payout — tight protection for higher risk entries
-    TIER1_THRESHOLD = 0.82
-    TIER2_THRESHOLD = 0.75
-    TIER1_STOP_DROP = 0.20  # absolute 20¢ drop from entry
-
-    if entry_price >= TIER1_THRESHOLD:
-        # Tier 1: absolute price floor
-        price_drop = entry_price - current_price
-        if price_drop >= TIER1_STOP_DROP:
-            return True, "stop_loss", (
-                f"tier1 stop: price dropped ${price_drop:.3f}/contract "
-                f"(threshold=${TIER1_STOP_DROP:.2f}) from entry=${entry_price:.3f} "
-                f"to bid=${current_price:.3f}"
-            )
-        return False, None, None
-
-    elif entry_price >= TIER2_THRESHOLD:
-        # Tier 2: 25% of max_payout
-        SL_PCT = 0.25
-        MIN_STOP_DISTANCE = 0.02
-        sl_dollar = max(max_payout * SL_PCT, contracts * MIN_STOP_DISTANCE)
-        if unrealized_pnl <= -sl_dollar:
-            return True, "stop_loss", (
-                f"tier2 pnl ${unrealized_pnl:.2f} breached stop -${sl_dollar:.2f} "
-                f"(max_payout=${max_payout:.2f}, sl={SL_PCT:.0%})"
-            )
-        return False, None, None
-
-    else:
-        # Tier 3: 15% of max_payout
-        SL_PCT = 0.15
-        MIN_STOP_DISTANCE = 0.02
-        sl_dollar = max(max_payout * SL_PCT, contracts * MIN_STOP_DISTANCE)
-        if unrealized_pnl <= -sl_dollar:
-            return True, "stop_loss", (
-                f"tier3 pnl ${unrealized_pnl:.2f} breached stop -${sl_dollar:.2f} "
-                f"(max_payout=${max_payout:.2f}, sl={SL_PCT:.0%})"
-            )
-        return False, None, None
-
-
-def update_trailing_mark(ticker, current_price, direction="YES", conn=None):
-    """Update the high-water mark for trailing take-profit.
-
-    Both YES and NO positions track the highest bid seen, since current_price
-    is already in the correct terms for each side.
-    """
-    prev = TRAILING_HIGH.get(ticker, 0.0)
-    if current_price > prev:
-        TRAILING_HIGH[ticker] = current_price
-        if conn:
-            _save_trailing_mark(conn, ticker, direction, current_price)
-    return TRAILING_HIGH.get(ticker, current_price)
-
-
-def check_trailing_take_profit(ticker, entry_price, current_price, direction="YES", fee_per_contract=0.0, contracts=1):
-    """Check if price has dropped from peak enough to trigger trailing take-profit.
-
-    Trailing distance is tiered by entry price and tightens dynamically as
-    unrealized profit grows.  Trailing only activates once the position has
-    reached at least TRAILING_TP_ACTIVATION_PCT of max_payout in profit.
-    """
-    total_fees = fee_per_contract * contracts
-    max_payout = max(0.01, contracts * (1.0 - entry_price) - total_fees)
-
-    # Breakeven = entry price + round-trip fees per contract + safety buffer
-    FEE_SAFETY_BUFFER = 0.01
-    breakeven = entry_price + fee_per_contract + FEE_SAFETY_BUFFER
-
-    high = TRAILING_HIGH.get(ticker, current_price)
-
-    # --- Activation gate: don't trail until meaningful profit is reached ---
-    # Tiered: higher gate for <80¢ entries (more runway, need more profit before trailing)
-    if entry_price >= 0.80:
-        activation_pct = TRAILING_TP_ACTIVATION_PCT  # 10% of max_payout
-    else:
-        activation_pct = 0.25  # 25% of max_payout for lower entries
-    activation_threshold = breakeven + (max_payout * activation_pct) / contracts
-    if high <= activation_threshold:
-        return False, None
-
-    # --- Tiered base trailing distance by entry price ---
-    if entry_price >= 0.90:
-        base_pct = 0.055      # 5.5% for very high confidence entries
-    elif entry_price >= 0.80:
-        base_pct = 0.045      # 4.5%
-    else:
-        base_pct = 0.05       # 5.0% for lower entries — wider to avoid premature exits
-
-    trailing_drop = base_pct * entry_price
-
-    # --- Dynamic tightening as profit grows ---
-    # current_pnl_pct = fraction of max_payout already captured at peak
-    peak_profit_per_contract = high - entry_price - fee_per_contract
-    max_profit_per_contract = (1.0 - entry_price) - fee_per_contract
-    if max_profit_per_contract > 0:
-        profit_fraction = peak_profit_per_contract / max_profit_per_contract
-    else:
-        profit_fraction = 0.0
-
-    if profit_fraction >= 0.40:
-        trailing_drop *= 0.65   # tighten significantly — lock in most of the gain
-    elif profit_fraction >= 0.25:
-        trailing_drop *= 0.80   # moderate tightening
-
-    # Also factor in the max_payout-based drop (original logic) and take the larger
-    trailing_drop_payout = (max_payout * 0.15) / contracts if contracts > 0 else 0.02
-    trailing_drop = max(trailing_drop, trailing_drop_payout)
-
-    # Absolute minimum floor: 3.5¢ for high entries, 3¢ for lower
-    abs_min = 0.035 if entry_price >= 0.80 else 0.03
-    trailing_drop = max(trailing_drop, abs_min)
-
-    # Floor = peak minus trailing drop, but NEVER below breakeven
-    floor = max(breakeven, high - trailing_drop)
-    if current_price <= floor:
-        return True, (
-            f"trailing TP: peak=${high:.3f} floor=${floor:.3f} breakeven=${breakeven:.3f} "
-            f"now=${current_price:.3f} (trail=${trailing_drop:.4f} profit_frac={profit_fraction:.0%})" 
+    # --- Hard stop: 50% loss on original position value ---
+    position_value = contracts * entry_price
+    if position_value > 0 and unrealized_pnl <= -(position_value * 0.50):
+        return True, "stop_loss", (
+            f"hard stop: position lost 50%+ of entry value "
+            f"(entry_value=${position_value:.2f}, pnl=${unrealized_pnl:.2f}, "
+            f"entry=${entry_price:.3f}, bid=${current_price:.3f})"
         )
-    return False, None
+
+    return False, None, None
+
 
 # --- WebSocket orderbook state ---
 # Full orderbook per ticker: { ticker: { "yes": {price: size, ...}, "no": {price: size, ...} } }
 WS_ORDERBOOKS = {}
+_BOOK_LOCK = threading.Lock()
 
 def _book_to_sorted_list(book_dict):
     """Convert {price: size} dict → [[price, size], ...] sorted ascending by price."""
@@ -349,10 +178,10 @@ def handle_orderbook_ws(ticker, msg_type, data):
         no_levels = data.get("no_dollars_fp", data.get("no", []))
         yes_book = {float(p): float(s) for p, s in yes_levels} if yes_levels else {}
         no_book = {float(p): float(s) for p, s in no_levels} if no_levels else {}
-        WS_ORDERBOOKS[ticker] = {"yes": yes_book, "no": no_book}
+        with _BOOK_LOCK:
+            WS_ORDERBOOKS[ticker] = {"yes": yes_book, "no": no_book}
     else:
         # Delta: single price level update with side, price_dollars, delta_fp
-        existing = WS_ORDERBOOKS.get(ticker, {"yes": {}, "no": {}})
         side = data.get("side", "")
         price_str = data.get("price_dollars")
         delta_str = data.get("delta_fp")
@@ -360,24 +189,27 @@ def handle_orderbook_ws(ticker, msg_type, data):
         if price_str is not None and delta_str is not None and side in ("yes", "no"):
             price = float(price_str)
             delta = float(delta_str)
-            current_size = existing[side].get(price, 0.0)
-            new_size = current_size + delta
-            if new_size <= 0:
-                existing[side].pop(price, None)
-            else:
-                existing[side][price] = new_size
-        WS_ORDERBOOKS[ticker] = existing
+            with _BOOK_LOCK:
+                existing = WS_ORDERBOOKS.get(ticker, {"yes": {}, "no": {}})
+                current_size = existing[side].get(price, 0.0)
+                new_size = current_size + delta
+                if new_size <= 0:
+                    existing[side].pop(price, None)
+                else:
+                    existing[side][price] = new_size
+                WS_ORDERBOOKS[ticker] = existing
 
     # Build sorted arrays and push to REALTIME_QUOTES
-    book = WS_ORDERBOOKS[ticker]
-    yes_sorted = _book_to_sorted_list(book["yes"])
-    no_sorted = _book_to_sorted_list(book["no"])
+    with _BOOK_LOCK:
+        book = WS_ORDERBOOKS.get(ticker, {"yes": {}, "no": {}})
+        yes_sorted = _book_to_sorted_list(book["yes"])
+        no_sorted = _book_to_sorted_list(book["no"])
 
-    REALTIME_QUOTES[ticker] = {
-        "yes_dollars": yes_sorted,
-        "no_dollars": no_sorted,
-        "timestamp": datetime.now(timezone.utc)
-    }
+        REALTIME_QUOTES[ticker] = {
+            "yes_dollars": yes_sorted,
+            "no_dollars": no_sorted,
+            "timestamp": datetime.now(timezone.utc)
+        }
 
     # --- Live order flow logging ---
     yes_best = yes_sorted[-1] if yes_sorted else None
@@ -463,18 +295,19 @@ def signed_request(method, path, params=None, body=None):
     signature = create_signature(private_key, timestamp, method.upper(), sign_path)
 
     headers = {
-        "Content-Type": "application/json" if body else None,
         "KALSHI-ACCESS-KEY": KALSHI_API_KEY_ID,
         "KALSHI-ACCESS-SIGNATURE": signature,
         "KALSHI-ACCESS-TIMESTAMP": timestamp,
     }
+    if body:
+        headers["Content-Type"] = "application/json"
 
     url = f"{host}{full_path}"
 
     if method.upper() == "GET":
-        response = requests.get(url, headers=headers, timeout=5)
+        response = requests.get(url, headers=headers, timeout=10)
     elif method.upper() == "POST":
-        response = requests.post(url, headers=headers, json=body, timeout=5)
+        response = requests.post(url, headers=headers, json=body, timeout=10)
     else:
         raise ValueError(f"Unsupported method: {method}")
 
@@ -1104,14 +937,12 @@ def _execute_exit(ticker, direction, contracts, entry_price, entry_fees, trigger
             rows_closed = mark_fills_closed(cursor, ticker, exit_price, trigger)
             conn.commit()
             logger.info(f"Marked {rows_closed} OPEN fill(s) as CLOSED for {ticker} at exit={exit_price:.4f}")
-            _delete_trailing_mark(conn, ticker)
         finally:
             conn.close()
 
-        # Clean trailing marks for closed position
-        TRAILING_HIGH.pop(ticker, None)
-        STOP_LOSS_CONSECUTIVE_HITS.pop(ticker, None)
-        TRAILING_TP_CONSECUTIVE_HITS.pop(ticker, None)
+        # Clean state for closed position
+        with _STATE_LOCK:
+            STOP_LOSS_CONSECUTIVE_HITS.pop(ticker, None)
 
         if trigger == "stop_loss" and realized_pnl_pct < -20.0:
             logger.error(f"ALERT: Close order for {ticker} executed with severe loss {realized_pnl_pct:.2f}%")
@@ -1146,15 +977,12 @@ def monitor_positions_once():
         logger.info("[MONITOR] Position monitor is PAUSED via Discord — skipping cycle")
         return
 
-    logger.info("Checking open positions for take-profit/stop-loss exits...")
+    logger.info("Checking open positions for stop-loss exits...")
 
     positions = get_current_positions()
 
     conn = get_db_connection()
     cursor = conn.cursor()
-
-    # Load persisted trailing marks on first run
-    _load_trailing_marks_from_db(conn)
 
     # --- Reconcile: close DB fills for tickers with zero exchange position ---
     api_tickers = {p.get('ticker') for p in positions if p.get('ticker')} if positions else set()
@@ -1294,9 +1122,6 @@ def monitor_positions_once():
         # Compute total market duration for proportional hold gate
         market_duration_seconds = _compute_market_duration(market.get("open_time"), market.get("close_time"))
 
-        # Update trailing high/low water mark
-        update_trailing_mark(ticker, current_price, direction, conn=conn)
-
         # Smart exit decision
         should_exit, trigger, exit_reason = compute_smart_exit(
             entry_price, current_price, direction, seconds_to_close, market_duration_seconds,
@@ -1307,27 +1132,22 @@ def monitor_positions_once():
         # BUT: skip confirmations for severe breaches (2x+ threshold) — exit immediately
         severe_breach = False
         if should_exit and trigger == "stop_loss":
-            # Compute the effective SL threshold for this tier to check severity
+            # Severity check: 75%+ loss is severe — skip confirmations
             total_fees = fee_per_contract * contracts
-            max_payout = max(0.01, contracts * (1.0 - entry_price) - total_fees)
             unrealized_pnl = contracts * (current_price - entry_price) - total_fees
-            if entry_price >= 0.82:
-                sl_dollar = contracts * 0.20  # tier1: absolute 20¢
-            elif entry_price >= 0.75:
-                sl_dollar = max(max_payout * 0.25, contracts * 0.02)  # tier2: 25%
-            else:
-                sl_dollar = max(max_payout * 0.15, contracts * 0.02)  # tier3: 15%
-            severe_breach = unrealized_pnl <= -(sl_dollar * 1.5)  # loss is 1.5x+ the threshold
+            position_value = contracts * entry_price
+            severe_breach = position_value > 0 and unrealized_pnl <= -(position_value * 0.75)
 
             if severe_breach:
                 logger.warning(
-                    f"[EXIT] SEVERE: {ticker} | pnl=${unrealized_pnl:.2f} vs threshold -${sl_dollar:.2f} — "
+                    f"[EXIT] SEVERE: {ticker} | pnl=${unrealized_pnl:.2f} vs entry_value=${position_value:.2f} — "
                     f"skipping confirmation, exiting immediately"
                 )
                 exit_reason = f"{exit_reason} (severe breach — immediate exit)"
             else:
-                hits = STOP_LOSS_CONSECUTIVE_HITS.get(ticker, 0) + 1
-                STOP_LOSS_CONSECUTIVE_HITS[ticker] = hits
+                with _STATE_LOCK:
+                    hits = STOP_LOSS_CONSECUTIVE_HITS.get(ticker, 0) + 1
+                    STOP_LOSS_CONSECUTIVE_HITS[ticker] = hits
                 if hits < STOP_LOSS_CONFIRMATIONS_REQUIRED:
                     logger.warning(
                         f"[EXIT] CONFIRM_WAIT: {ticker} | stop-loss breach {hits}/{STOP_LOSS_CONFIRMATIONS_REQUIRED} | "
@@ -1340,46 +1160,16 @@ def monitor_positions_once():
                     exit_reason = f"{exit_reason} (confirmed {hits}/{STOP_LOSS_CONFIRMATIONS_REQUIRED})"
         elif trigger != "stop_loss":
             # Price recovered above stop — reset counter
-            STOP_LOSS_CONSECUTIVE_HITS.pop(ticker, None)
-
-        # Check trailing take-profit if smart exit didn't trigger
-        if not should_exit:
-            should_exit, trailing_reason = check_trailing_take_profit(ticker, entry_price, current_price, direction, fee_per_contract=fee_per_contract, contracts=contracts)
-            if should_exit:
-                # Dynamic confirmation count: more confirmations when deep in profit
-                total_fees_tp = fee_per_contract * contracts
-                max_profit_pc = (1.0 - entry_price) - fee_per_contract
-                peak_profit_pc = TRAILING_HIGH.get(ticker, current_price) - entry_price - fee_per_contract
-                profit_frac = peak_profit_pc / max_profit_pc if max_profit_pc > 0 else 0.0
-                confirmations_needed = (
-                    TRAILING_TP_CONFIRMATIONS_DEEP_PROFIT if profit_frac >= 0.30
-                    else TRAILING_TP_CONFIRMATIONS_BASE
-                )
-
-                tp_hits = TRAILING_TP_CONSECUTIVE_HITS.get(ticker, 0) + 1
-                TRAILING_TP_CONSECUTIVE_HITS[ticker] = tp_hits
-                if tp_hits < confirmations_needed:
-                    logger.warning(
-                        f"[EXIT] TP_CONFIRM_WAIT: {ticker} | trailing TP breach {tp_hits}/{confirmations_needed} | "
-                        f"current=${current_price:.3f} | floor from trail | profit_frac={profit_frac:.0%} | "
-                        f"{trailing_reason} — waiting for confirmation"
-                    )
-                    should_exit = False
-                else:
-                    trigger = "take_profit"
-                    exit_reason = f"{trailing_reason} (confirmed {tp_hits}/{confirmations_needed})"
-            else:
-                # Price recovered above trailing floor — reset counter
-                TRAILING_TP_CONSECUTIVE_HITS.pop(ticker, None)
+            with _STATE_LOCK:
+                STOP_LOSS_CONSECUTIVE_HITS.pop(ticker, None)
 
         ttc_str = f"{seconds_to_close:.0f}s" if seconds_to_close is not None else "unknown"
-        trail_str = f"${TRAILING_HIGH.get(ticker, 0):.3f}"
 
         logger.info(
             f"{ticker} | dir={direction} | contracts={contracts} | entry={entry_price:.3f} | "
             f"entry_source={entry_source} | mark={current_price:.3f} | quote_source={executable_quote['source']} | "
             f"unrealized_pnl=${unrealized_pnl:.2f} | pnl_pct={unrealized_pnl_pct:.2f}% | "
-            f"ttc={ttc_str} | trail={trail_str} | exit={'YES:'+trigger if should_exit else 'NO'}"
+            f"ttc={ttc_str} | exit={'YES:'+trigger if should_exit else 'NO'}"
         )
 
         if not should_exit:
@@ -1434,8 +1224,8 @@ def monitor_positions_once():
                             _execute_exit(t, d, c, ep, ef, tr, er, ck)
                         else:
                             logger.info(f"[EXIT] {'REJECTED by user' if result == 'rejected' else 'NO RESPONSE (timeout)'} — holding: {t} | {tr}")
-                            STOP_LOSS_CONSECUTIVE_HITS.pop(t, None)
-                            TRAILING_TP_CONSECUTIVE_HITS.pop(t, None)
+                            with _STATE_LOCK:
+                                STOP_LOSS_CONSECUTIVE_HITS.pop(t, None)
                             PENDING_CLOSE_UNTIL.pop(ck, None)
                     except Exception as e:
                         logger.error(f"[EXIT] Discord approval thread error for {t}: {e}")

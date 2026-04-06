@@ -46,7 +46,6 @@ def get_rolling_24h_performance(db_path: str = "trades.db", account_balance: flo
             """
         )
         wins, losses, pnl_total, total_cost = cursor.fetchone()
-        conn.close()
 
         wins = int(wins or 0)
         losses = int(losses or 0)
@@ -68,6 +67,11 @@ def get_rolling_24h_performance(db_path: str = "trades.db", account_balance: flo
         })
     except Exception as e:
         print(f"[DISCORD] Failed to compute rolling 24h performance: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     return metrics
 
@@ -97,7 +101,6 @@ def get_all_time_performance(db_path: str = "trades.db", account_balance: float 
             """
         )
         wins, losses, pnl_total, total_cost = cursor.fetchone()
-        conn.close()
 
         wins = int(wins or 0)
         losses = int(losses or 0)
@@ -119,6 +122,11 @@ def get_all_time_performance(db_path: str = "trades.db", account_balance: float 
         })
     except Exception as e:
         print(f"[DISCORD] Failed to compute all-time performance: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     return metrics
 
@@ -283,7 +291,7 @@ def notify_position_closed(
 ):
     """Send notification when a position close order is submitted."""
     message = "📉 **Position Closed**"
-    trigger_label = "Take Profit" if trigger == "take_profit" else "Stop Loss"
+    trigger_label = "Stop Loss"
 
     total_cost = entry_price * quantity + entry_fees
     total_exit = exit_price * quantity - exit_fees
@@ -296,8 +304,7 @@ def notify_position_closed(
     if order_status:
         fields.append({"name": "Exchange Status", "value": order_status, "inline": True})
 
-    # Color by trigger: take-profit = green, stop-loss = red
-    color = 3066993 if trigger == "take_profit" else 15158332
+    color = 15158332  # red for stop-loss
 
     embed_data = {
         "title": "Exit Order Submitted",

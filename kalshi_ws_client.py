@@ -41,6 +41,8 @@ class KalshiWebSocketClient:
         self._loop = asyncio.get_event_loop()
         backoff = 1  # seconds
         max_backoff = 60
+        consecutive_failures = 0
+        max_consecutive_failures = 20  # stop retrying after ~15 min of failures
         while True:
             try:
                 async with websockets.connect(
@@ -48,17 +50,27 @@ class KalshiWebSocketClient:
                     additional_headers=self._auth_headers(),
                     ping_interval=20,
                     ping_timeout=10,
+                    open_timeout=10,
+                    close_timeout=5,
                 ) as ws:
                     self.ws = ws
                     self._connected = True
                     backoff = 1  # reset on successful connect
+                    consecutive_failures = 0
                     logger.info("WebSocket connected. Subscribing to tickers...")
                     await self._subscribe_all()
                     await self._listen()
             except Exception as e:
                 self._connected = False
                 self.ws = None
-                logger.warning(f"WebSocket disconnected: {e}. Reconnecting in {backoff}s...")
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    logger.error(
+                        f"WebSocket circuit breaker: {consecutive_failures} consecutive failures. "
+                        f"Last error: {e}. Stopping reconnect loop."
+                    )
+                    break
+                logger.warning(f"WebSocket disconnected: {e}. Reconnecting in {backoff}s... (attempt {consecutive_failures})")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
 
@@ -116,9 +128,11 @@ class KalshiWebSocketClient:
         return headers
 
     async def _subscribe_all(self):
-        for ticker in self.tickers:
+        async with self._lock:
+            tickers_snapshot = list(self.tickers)
+        for i, ticker in enumerate(tickers_snapshot):
             sub_msg = {
-                "id": int(time.time() * 1000),
+                "id": int(time.time() * 1000) + i,
                 "cmd": "subscribe",
                 "params": {
                     "channels": ["orderbook_delta"],

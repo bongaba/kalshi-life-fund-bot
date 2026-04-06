@@ -2,8 +2,6 @@ from grok_analyzer import get_grok_decision
 from config import *
 from loguru import logger
 from concurrent.futures import ThreadPoolExecutor
-import joblib
-import pandas as pd
 from datetime import datetime, timezone
 
 # Load the trained historical model
@@ -185,7 +183,14 @@ def analyze_market_with_validators(
                 volume,
                 hours_to_close,
             )
-        grok_result = grok_future.result() if grok_future is not None else None
+        if grok_future is not None:
+            try:
+                grok_result = grok_future.result(timeout=90)
+            except Exception as e:
+                logger.error(f"[DECISION_ENGINE] Grok validator failed: {e} — falling back to HOLD")
+                grok_result = {"direction": "HOLD", "confidence": 0, "reason": f"Grok error: {e}"}
+        else:
+            grok_result = None
     return None, grok_result
 
 def should_trade(market: dict) -> dict | None:
