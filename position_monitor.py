@@ -118,9 +118,8 @@ REALTIME_QUOTES = {}
 # Lock for global state accessed by both the monitor loop and daemon exit threads
 _STATE_LOCK = threading.Lock()
 
-# Stop-loss confirmation: require N consecutive breaches before executing
-STOP_LOSS_CONFIRMATIONS_REQUIRED = 3
-STOP_LOSS_CONSECUTIVE_HITS = {}  # ticker -> consecutive breach count
+# Stop-loss auto-execute: track first breach timestamp, auto-exit after 2s sustained
+STOP_LOSS_BREACH_START = {}  # ticker -> time.monotonic() of first breach
 
 
 def compute_smart_exit(entry_price, current_price, direction, seconds_to_close, market_duration_seconds=None, fee_per_contract=0.0, contracts=1):
@@ -942,7 +941,7 @@ def _execute_exit(ticker, direction, contracts, entry_price, entry_fees, trigger
 
         # Clean state for closed position
         with _STATE_LOCK:
-            STOP_LOSS_CONSECUTIVE_HITS.pop(ticker, None)
+            STOP_LOSS_BREACH_START.pop(ticker, None)
 
         if trigger == "stop_loss" and realized_pnl_pct < -20.0:
             logger.error(f"ALERT: Close order for {ticker} executed with severe loss {realized_pnl_pct:.2f}%")
@@ -1128,11 +1127,12 @@ def monitor_positions_once():
             fee_per_contract=fee_per_contract, contracts=contracts
         )
 
-        # Stop-loss confirmation: require N consecutive breaches to filter volatility
-        # BUT: skip confirmations for severe breaches (2x+ threshold) — exit immediately
+        # Stop-loss: track breach duration, auto-execute after 2s sustained breach
+        # Severe breaches (75%+ loss) still exit immediately
         severe_breach = False
+        auto_execute_sl = False
         if should_exit and trigger == "stop_loss":
-            # Severity check: 75%+ loss is severe — skip confirmations
+            # Severity check: 75%+ loss is severe — exit immediately
             total_fees = fee_per_contract * contracts
             unrealized_pnl = contracts * (current_price - entry_price) - total_fees
             position_value = contracts * entry_price
@@ -1144,24 +1144,28 @@ def monitor_positions_once():
                     f"skipping confirmation, exiting immediately"
                 )
                 exit_reason = f"{exit_reason} (severe breach — immediate exit)"
+                auto_execute_sl = True
             else:
+                now_mono = time.monotonic()
                 with _STATE_LOCK:
-                    hits = STOP_LOSS_CONSECUTIVE_HITS.get(ticker, 0) + 1
-                    STOP_LOSS_CONSECUTIVE_HITS[ticker] = hits
-                if hits < STOP_LOSS_CONFIRMATIONS_REQUIRED:
+                    if ticker not in STOP_LOSS_BREACH_START:
+                        STOP_LOSS_BREACH_START[ticker] = now_mono
+                    breach_elapsed = now_mono - STOP_LOSS_BREACH_START[ticker]
+                if breach_elapsed < 2.0:
                     logger.warning(
-                        f"[EXIT] CONFIRM_WAIT: {ticker} | stop-loss breach {hits}/{STOP_LOSS_CONFIRMATIONS_REQUIRED} | "
-                        f"{exit_reason} — waiting for confirmation"
+                        f"[EXIT] BREACH_WAIT: {ticker} | stop-loss breach for {breach_elapsed:.1f}s / 2.0s | "
+                        f"{exit_reason} — waiting for sustained breach"
                     )
                     should_exit = False
                     trigger = None
                     exit_reason = None
                 else:
-                    exit_reason = f"{exit_reason} (confirmed {hits}/{STOP_LOSS_CONFIRMATIONS_REQUIRED})"
+                    exit_reason = f"{exit_reason} (sustained {breach_elapsed:.1f}s — auto-executing)"
+                    auto_execute_sl = True
         elif trigger != "stop_loss":
-            # Price recovered above stop — reset counter
+            # Price recovered above stop — reset breach timer
             with _STATE_LOCK:
-                STOP_LOSS_CONSECUTIVE_HITS.pop(ticker, None)
+                STOP_LOSS_BREACH_START.pop(ticker, None)
 
         ttc_str = f"{seconds_to_close:.0f}s" if seconds_to_close is not None else "unknown"
 
@@ -1191,8 +1195,25 @@ def monitor_positions_once():
             f"reason={exit_reason}"
         )
 
+        # --- Auto-execute stop-loss (no approval needed) ---
+        if auto_execute_sl:
+            logger.warning(f"[EXIT] AUTO-EXECUTING stop-loss for {ticker} — no Discord approval required")
+            # Notify Discord (info only, not an approval request)
+            if discord_bot.is_configured():
+                discord_bot.send_exit_result(
+                    ticker=ticker,
+                    trigger="stop_loss",
+                    direction=direction,
+                    contracts=contracts,
+                    entry_price=entry_price,
+                    exit_price=current_price,
+                    pnl=unrealized_pnl,
+                    status="AUTO_SL",
+                )
+            _execute_exit(ticker, direction, contracts, entry_price, entry_fees, trigger, exit_reason, close_key)
+            continue
+
         # --- Interactive Discord approval (non-blocking) ---
-        # ALL exits require user approval — no automatic execution
         if DISCORD_INTERACTIVE_SL_TP and discord_bot.is_configured():
             # If this ticker is already pending approval, skip (don't double-send)
             if ticker in PENDING_DISCORD_APPROVALS:
@@ -1225,7 +1246,7 @@ def monitor_positions_once():
                         else:
                             logger.info(f"[EXIT] {'REJECTED by user' if result == 'rejected' else 'NO RESPONSE (timeout)'} — holding: {t} | {tr}")
                             with _STATE_LOCK:
-                                STOP_LOSS_CONSECUTIVE_HITS.pop(t, None)
+                                STOP_LOSS_BREACH_START.pop(t, None)
                             PENDING_CLOSE_UNTIL.pop(ck, None)
                     except Exception as e:
                         logger.error(f"[EXIT] Discord approval thread error for {t}: {e}")

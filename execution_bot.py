@@ -831,6 +831,18 @@ def main_loop():
                 limit_price_dollars = limit_price_cents / 100.0
                 # Number of contracts to buy, derived from the size computed in the decision engine.
                 count = int(decision["size"] * 100)
+
+                # Ultra-high probability: allocate 50% of available cash instead of normal sizing
+                if decision.get("half_cash_sizing") and limit_price_dollars > 0:
+                    half_cash_count = int((cash * 0.50) / limit_price_dollars)
+                    if half_cash_count > count:
+                        logger.info(
+                            f"[SIZING] Ultra-high probability override for {ticker}: "
+                            f"normal={count} contracts → 50% cash={half_cash_count} contracts "
+                            f"(cash=${cash:.2f}, limit=${limit_price_dollars:.4f})"
+                        )
+                        count = half_cash_count
+
                 total_order_cost = count * limit_price_dollars
 
                 client_order_id = f"life-fund-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
