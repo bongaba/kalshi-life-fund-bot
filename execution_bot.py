@@ -827,7 +827,7 @@ def main_loop():
                     contract_price = price_data.get('no_ask') or no_price
 
                 SLIPPAGE_CENTS = 1  # 1¢ slippage tolerance
-                limit_price_cents = int(contract_price * 100) + SLIPPAGE_CENTS
+                limit_price_cents = min(99, int(contract_price * 100) + SLIPPAGE_CENTS)  # cap at 99¢ (Kalshi max)
                 limit_price_dollars = limit_price_cents / 100.0
                 # Number of contracts to buy, derived from the size computed in the decision engine.
                 count = int(decision["size"] * 100)
