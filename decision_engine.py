@@ -268,6 +268,21 @@ def should_trade(market: dict) -> dict | None:
     if internal_decision == "HOLD":
         return None  # Not high probability enough, skip
 
+    # Ultra-high probability: above upper limit — skip Grok, execute immediately with 50% cash
+    if internal_result.get("half_cash_sizing"):
+        logger.info(
+            f"[DECISION_ENGINE] Ultra-high probability — skipping Grok | ticker={market.get('ticker', 'UNKNOWN')} | "
+            f"direction={internal_decision} | reason={internal_result['reason']}"
+        )
+        return {
+            "direction": internal_decision,
+            "size": round(RISK_PER_TRADE, 2),
+            "confidence": 100,
+            "is_undervalued": False,
+            "reason": f"Ultra-high probability: {internal_result['reason']} (Grok bypassed)",
+            "half_cash_sizing": True,
+        }
+
     logger.info(
         f"[DECISION_ENGINE] External validation starting | ticker={market.get('ticker', 'UNKNOWN')} | "
         f"internal_decision={internal_decision} | undervalued={internal_result['is_undervalued']}"
