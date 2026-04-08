@@ -128,7 +128,7 @@ def compute_smart_exit(entry_price, current_price, direction, seconds_to_close, 
     Binary contracts settle at $1.00 (win) or $0.00 (lose).
     Returns (should_exit, trigger, reason) tuple.
 
-    Stop-loss: triggers when position loses 80%+ of original entry value.
+    Stop-loss: triggers when position loses 70%+ of original entry value.
     """
     # --- Max payout: total possible profit if contract settles at $1.00 ---
     total_fees = fee_per_contract * contracts
@@ -139,11 +139,11 @@ def compute_smart_exit(entry_price, current_price, direction, seconds_to_close, 
     # so profit = current - entry for both directions.
     unrealized_pnl = contracts * (current_price - entry_price) - total_fees
 
-    # --- Hard stop: 80% loss on original position value ---
+    # --- Hard stop: 70% loss on original position value ---
     position_value = contracts * entry_price
-    if position_value > 0 and unrealized_pnl <= -(position_value * 0.80):
+    if position_value > 0 and unrealized_pnl <= -(position_value * 0.70):
         return True, "stop_loss", (
-            f"hard stop: position lost 80%+ of entry value "
+            f"hard stop: position lost 70%+ of entry value "
             f"(entry_value=${position_value:.2f}, pnl=${unrealized_pnl:.2f}, "
             f"entry=${entry_price:.3f}, bid=${current_price:.3f})"
         )
@@ -1132,11 +1132,11 @@ def monitor_positions_once():
         severe_breach = False
         auto_execute_sl = False
         if should_exit and trigger == "stop_loss":
-            # Severity check: 90%+ loss is severe — exit immediately
+            # Severity check: 85%+ loss is severe — exit immediately
             total_fees = fee_per_contract * contracts
             unrealized_pnl = contracts * (current_price - entry_price) - total_fees
             position_value = contracts * entry_price
-            severe_breach = position_value > 0 and unrealized_pnl <= -(position_value * 0.90)
+            severe_breach = position_value > 0 and unrealized_pnl <= -(position_value * 0.85)
 
             if severe_breach:
                 logger.warning(
@@ -1151,9 +1151,9 @@ def monitor_positions_once():
                     if ticker not in STOP_LOSS_BREACH_START:
                         STOP_LOSS_BREACH_START[ticker] = now_mono
                     breach_elapsed = now_mono - STOP_LOSS_BREACH_START[ticker]
-                if breach_elapsed < 2.0:
+                if breach_elapsed < 3.0:
                     logger.warning(
-                        f"[EXIT] BREACH_WAIT: {ticker} | stop-loss breach for {breach_elapsed:.1f}s / 2.0s | "
+                        f"[EXIT] BREACH_WAIT: {ticker} | stop-loss breach for {breach_elapsed:.1f}s / 3.0s | "
                         f"{exit_reason} — waiting for sustained breach"
                     )
                     should_exit = False
