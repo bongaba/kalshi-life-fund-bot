@@ -44,7 +44,6 @@ def internal_model_decision(yes_price: float, no_price: float) -> dict:
     logger.info(
         f"[DECISION_ENGINE] internal_model_decision starting | yes_price={yes_price:.3f} | no_price={no_price:.3f} | "
         f"high_probability_threshold={INTERNAL_HIGH_PROBABILITY_THRESHOLD:.2f} | "
-        f"high_probability_upper_limit={INTERNAL_HIGH_PROBABILITY_UPPER_LIMIT:.2f} | "
         f"use_undervalued_markets={USE_UNDERVALUED_MARKETS}"
     )
 
@@ -52,12 +51,6 @@ def internal_model_decision(yes_price: float, no_price: float) -> dict:
         return {"direction": "YES", "is_undervalued": False, "reason": "high_probability_yes"}
     if INTERNAL_HIGH_PROBABILITY_THRESHOLD <= no_price <= INTERNAL_HIGH_PROBABILITY_UPPER_LIMIT:
         return {"direction": "NO", "is_undervalued": False, "reason": "high_probability_no"}
-
-    # Ultra-high probability: above upper limit but below 1.0 — allocate 50% of cash
-    if INTERNAL_HIGH_PROBABILITY_UPPER_LIMIT < yes_price < 1.0:
-        return {"direction": "YES", "is_undervalued": False, "reason": "ultra_high_probability_yes", "half_cash_sizing": True}
-    if INTERNAL_HIGH_PROBABILITY_UPPER_LIMIT < no_price < 1.0:
-        return {"direction": "NO", "is_undervalued": False, "reason": "ultra_high_probability_no", "half_cash_sizing": True}
 
     if USE_UNDERVALUED_MARKETS:
         undervalued_result = calculate_undervalued_market(yes_price, no_price)
@@ -268,21 +261,6 @@ def should_trade(market: dict) -> dict | None:
     if internal_decision == "HOLD":
         return None  # Not high probability enough, skip
 
-    # Ultra-high probability: above upper limit — skip Grok, execute immediately with 50% cash
-    if internal_result.get("half_cash_sizing"):
-        logger.info(
-            f"[DECISION_ENGINE] Ultra-high probability — skipping Grok | ticker={market.get('ticker', 'UNKNOWN')} | "
-            f"direction={internal_decision} | reason={internal_result['reason']}"
-        )
-        return {
-            "direction": internal_decision,
-            "size": round(RISK_PER_TRADE, 2),
-            "confidence": 100,
-            "is_undervalued": False,
-            "reason": f"Ultra-high probability: {internal_result['reason']} (Grok bypassed)",
-            "half_cash_sizing": True,
-        }
-
     logger.info(
         f"[DECISION_ENGINE] External validation starting | ticker={market.get('ticker', 'UNKNOWN')} | "
         f"internal_decision={internal_decision} | undervalued={internal_result['is_undervalued']}"
@@ -346,8 +324,6 @@ def should_trade(market: dict) -> dict | None:
             "is_undervalued": internal_result["is_undervalued"],
             "reason": " | ".join(reason_parts),
         }
-        if internal_result.get("half_cash_sizing"):
-            result["half_cash_sizing"] = True
         return result
 
     logger.info(

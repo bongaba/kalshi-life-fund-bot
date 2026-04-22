@@ -1,11 +1,19 @@
+from __future__ import annotations
 import json
 import time
 from config import GROK_DETAILED_LOG, XAI_API_KEY
 from loguru import logger
 from prompts import CATEGORY_PROMPTS, detect_category
-from xai_sdk import Client
-from xai_sdk.chat import user
-from xai_sdk.tools import web_search, x_search
+try:
+    from xai_sdk import Client
+    from xai_sdk.chat import user
+    from xai_sdk.tools import web_search, x_search
+except ImportError:
+    Client = None
+    user = None
+    web_search = None
+    x_search = None
+    logger.warning("[GROK] xai_sdk not installed — Grok features disabled")
 
 
 def log_grok_detail(message: str, *args) -> None:

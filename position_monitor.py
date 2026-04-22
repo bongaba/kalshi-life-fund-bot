@@ -22,6 +22,22 @@ def get_realtime_executable_quote(ticker, direction):
             "size": float(best[1]),
         }
 
+    def _infer_from_opposite(opposite_orders, timestamp, source_tag):
+        """When our side has no bids, infer price from the opposite side's best bid.
+        If YES best bid = $0.18 → implied NO value ≈ 1 - 0.18 = $0.82.
+        Marked as 'inferred' so downstream knows this isn't a real executable quote."""
+        opp = _extract_best_bid(opposite_orders)
+        if opp:
+            inferred_price = round(1.0 - opp["bid"], 2)
+            if 0.01 <= inferred_price <= 0.99:
+                return {
+                    "bid": inferred_price,
+                    "size": 0,  # no real liquidity on our side
+                    "timestamp": timestamp,
+                    "source": f"{source_tag}_inferred_from_opposite",
+                }, "inferred_bid"
+        return None, None
+
     # Try WebSocket cache first (primary source)
     with _BOOK_LOCK:
         q = REALTIME_QUOTES.get(ticker)
@@ -38,7 +54,18 @@ def get_realtime_executable_quote(ticker, direction):
                 result["timestamp"] = q["timestamp"]
                 result["source"] = "websocket"
                 return result, "executable_bid"
-            # WS book exists but no bids on our side — still valid data (market is thin)
+            # No bids on our side — try to infer from opposite side
+            opposite_key = "no_dollars" if direction == "YES" else "yes_dollars"
+            inferred, inferred_reason = _infer_from_opposite(
+                q.get(opposite_key, []), q["timestamp"], "websocket"
+            )
+            if inferred:
+                logger.info(
+                    f"[INFERRED] {ticker} {direction}: no {direction} bids, inferred "
+                    f"${inferred['bid']:.2f} from opposite side"
+                )
+                return inferred, inferred_reason
+            # WS book exists but no bids on either side
             if age <= QUOTE_FRESHNESS_SECONDS:
                 return None, f"no_{direction.lower()}_bids_in_ws_book"
 
@@ -77,6 +104,15 @@ def get_realtime_executable_quote(ticker, direction):
             result["timestamp"] = timestamp
             result["source"] = "rest_fallback"
             return result, "executable_bid"
+        # No bids on our side via REST — try opposite side inference
+        opposite_orders = no_orders if direction == "YES" else yes_orders
+        inferred, inferred_reason = _infer_from_opposite(opposite_orders, timestamp, "rest")
+        if inferred:
+            logger.info(
+                f"[INFERRED] {ticker} {direction}: no {direction} bids in REST, inferred "
+                f"${inferred['bid']:.2f} from opposite side"
+            )
+            return inferred, inferred_reason
         return None, f"no_{direction.lower()}_bids_in_orderbook"
     except Exception as e:
         logger.debug(f"Failed to fetch orderbook for {ticker}: {e}")
@@ -91,7 +127,7 @@ import uuid
 import threading
 from datetime import datetime, timezone
 from loguru import logger
-from logging_setup import setup_log_file, setup_error_log, setup_trade_decision_log
+from logging_setup import setup_log_file, setup_error_log, setup_trade_decision_log, setup_stop_loss_log
 from config import *
 from discord_notifications import notify_position_closed
 import discord_bot
@@ -108,6 +144,20 @@ import asyncio
 setup_log_file("monitor.log")
 setup_error_log()
 setup_trade_decision_log()
+setup_stop_loss_log()
+
+# Bound logger for structured stop-loss JSON-lines log
+sl_logger = logger.bind(sl_log=True)
+
+def log_sl_event(event, **kwargs):
+    """Write a structured JSON-lines record to the stop-loss log."""
+    import json as _json
+    record = {
+        "event": event,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        **kwargs,
+    }
+    sl_logger.info(_json.dumps(record, default=str))
 
 MONITOR_INTERVAL_SECONDS = POSITION_MONITOR_INTERVAL_SECONDS
 POSITION_CLOSE_COOLDOWN_SECONDS = max(10, MONITOR_INTERVAL_SECONDS * 2)
@@ -118,35 +168,228 @@ REALTIME_QUOTES = {}
 # Lock for global state accessed by both the monitor loop and daemon exit threads
 _STATE_LOCK = threading.Lock()
 
-# Stop-loss auto-execute: track first breach timestamp, auto-exit after 2s sustained
-STOP_LOSS_BREACH_START = {}  # ticker -> time.monotonic() of first breach
+# Stop-loss state tracking (per-ticker)
+from collections import deque
+TRAILING_EMA = {}           # ticker -> EMA-smoothed bid price (momentum reversal peak tracking only)
+TRAILING_PEAK = {}          # ticker -> highest smoothed position value since entry
+STOP_LOSS_BREACH_START = {} # ticker -> time.monotonic() of first breach
+RECENT_BID_SIZES = {}       # ticker -> deque of last 8 bid sizes
+MARK_HISTORY = {}           # ticker -> deque of (monotonic_time, mark_price) for stagnation detection
+EMA_UPDATE_COUNT = {}       # ticker -> int (number of EMA updates, for warmup gating)
+SL_EXIT_COOLDOWN = {}       # ticker -> monotonic time of last SL exit (re-entry prevention)
+
+# Orderbook momentum guard: opposite-side pressure detection
+MOMENTUM_GUARD_DELTA_FLOOR = 300        # absolute minimum delta to count as pressure
+MOMENTUM_GUARD_BEST_BID_RATIO = 0.60   # delta must be >= this fraction of best bid size
+MOMENTUM_GUARD_WINDOW_SECONDS = 8.0     # how recent the signal must be
+MOMENTUM_GUARD_ACCELERATED_WAIT = 1.0   # reduced sustained wait when pressure detected
+OPPOSITE_PRESSURE_SIGNALS = {}          # ticker -> {"side": "yes"|"no", "delta": float, "time": float}
 
 
-def compute_smart_exit(entry_price, current_price, direction, seconds_to_close, market_duration_seconds=None, fee_per_contract=0.0, contracts=1):
+def compute_smart_exit(entry_price, current_price, direction, seconds_to_close,
+                       market_duration_seconds=None, fee_per_contract=0.0, contracts=1,
+                       bid_size=0, ticker=None):
     """Compute whether to exit based on binary contract economics.
 
     Binary contracts settle at $1.00 (win) or $0.00 (lose).
     Returns (should_exit, trigger, reason) tuple.
 
-    Stop-loss: triggers when position loses 70%+ of original entry value.
+    When stop-loss is disabled via config, always returns (False, None, None).
     """
-    # --- Max payout: total possible profit if contract settles at $1.00 ---
+    if not POSITION_STOP_LOSS_ENABLED:
+        return False, None, None
+
     total_fees = fee_per_contract * contracts
-    max_payout = max(0.01, contracts * (1.0 - entry_price) - total_fees)
-
-    # --- Unrealized P&L in dollars ---
-    # current_price is already the bid for the position's side (YES bid or NO bid),
-    # so profit = current - entry for both directions.
     unrealized_pnl = contracts * (current_price - entry_price) - total_fees
-
-    # --- Hard stop: 70% loss on original position value ---
     position_value = contracts * entry_price
-    if position_value > 0 and unrealized_pnl <= -(position_value * 0.70):
-        return True, "stop_loss", (
-            f"hard stop: position lost 70%+ of entry value "
+
+    # === 1. Update EMA smoothed price (noise filter, α=0.25) ===
+    if ticker:
+        with _STATE_LOCK:
+            if ticker not in TRAILING_EMA:
+                TRAILING_EMA[ticker] = current_price
+            else:
+                TRAILING_EMA[ticker] = (0.25 * current_price) + (0.75 * TRAILING_EMA[ticker])
+            smoothed_bid = TRAILING_EMA[ticker]
+
+            # Track EMA update count for warmup gating
+            EMA_UPDATE_COUNT[ticker] = EMA_UPDATE_COUNT.get(ticker, 0) + 1
+
+            # === 2. Update trailing peak (highest smoothed value seen) ===
+            current_smoothed_value = contracts * smoothed_bid
+            if ticker not in TRAILING_PEAK or current_smoothed_value > TRAILING_PEAK[ticker]:
+                TRAILING_PEAK[ticker] = current_smoothed_value
+    else:
+        smoothed_bid = current_price
+        current_smoothed_value = contracts * smoothed_bid
+
+    # === 3. Edge erosion: tighter stop for expensive contracts ===
+    # The hard stop (70% of position value) is useless for high-entry contracts
+    # because the bid must drop to nearly zero before triggering.
+    # Edge erosion measures what fraction of the *profit potential* has been consumed
+    # by the drawdown, using the EMA-smoothed bid to filter noise.
+    #   edge = 1.00 - entry_price  (max profit per contract)
+    #   erosion = entry_price - smoothed_bid  (how far the smoothed bid has dropped)
+    #   erosion_ratio = erosion / edge
+    # Gating:
+    #   - EMA warmup: skip until >= 8 updates (≈16s) to avoid premature triggers from noisy first ticks
+    #   - TTC gate: skip when ttc <= 120s — late_pnl_stop handles the final window
+    #   - Proportional threshold: more lenient as market approaches close
+    #     ttc > 30 min → config value (80%), 10-30 min → 90%, < 10 min → disabled
+    edge_per_contract = 1.0 - entry_price
+    if edge_per_contract >= POSITION_STOP_LOSS_EDGE_EROSION_MIN_EDGE and POSITION_STOP_LOSS_EDGE_EROSION_PCT > 0 and ticker:
+        ema_updates = 0
+        with _STATE_LOCK:
+            ema_updates = EMA_UPDATE_COUNT.get(ticker, 0)
+
+        # Gate 1: EMA warmup — need >= 8 updates for stable smoothing
+        if ema_updates < 8:
+            pass  # skip edge erosion — EMA not yet reliable
+        # Gate 2: TTC — don't fire near settlement, let late_pnl_stop handle it
+        elif seconds_to_close is not None and seconds_to_close <= 120:
+            pass  # skip edge erosion — too close to settlement
+        else:
+            # Gate 3: Proportional threshold based on time-to-close
+            if seconds_to_close is not None and seconds_to_close <= 600:
+                # < 10 min: disable edge erosion entirely
+                effective_erosion_pct = None
+            elif seconds_to_close is not None and seconds_to_close <= 1800:
+                # 10-30 min: more lenient threshold
+                effective_erosion_pct = 0.90
+            else:
+                # > 30 min (or unknown ttc): use configured threshold
+                effective_erosion_pct = POSITION_STOP_LOSS_EDGE_EROSION_PCT
+
+            if effective_erosion_pct is not None:
+                erosion = entry_price - smoothed_bid
+                erosion_ratio = erosion / edge_per_contract if erosion > 0 else 0.0
+                if erosion_ratio >= effective_erosion_pct:
+                    trigger_bid = entry_price - (edge_per_contract * effective_erosion_pct)
+                    reason_ee = (
+                        f"edge erosion: EMA bid eroded {erosion_ratio:.1%} of profit edge "
+                        f"(entry=${entry_price:.3f}, ema_bid=${smoothed_bid:.3f}, "
+                        f"edge=${edge_per_contract:.3f}, erosion=${erosion:.3f}, "
+                        f"threshold={effective_erosion_pct:.0%}, trigger_bid=${trigger_bid:.3f}, "
+                        f"ema_updates={ema_updates})"
+                    )
+                    log_sl_event("edge_erosion_triggered", ticker=ticker, direction=direction,
+                                 contracts=contracts, entry_price=entry_price, bid=current_price,
+                                 ema_bid=round(smoothed_bid, 4), edge=round(edge_per_contract, 4),
+                                 erosion=round(erosion, 4), erosion_ratio=round(erosion_ratio, 4),
+                                 threshold=effective_erosion_pct, bid_size=bid_size,
+                                 ema_updates=ema_updates,
+                                 ttc=round(seconds_to_close, 1) if seconds_to_close is not None else None)
+                    return True, "edge_erosion", reason_ee
+
+    # === 3a. Late-stage PnL stop: time-weighted exit for mid-priced contracts ===
+    # Data-driven from 57 15M BTC trades: catches 6/12 losses with 0/40 false triggers.
+    # ttc<=30s + pnl<-8%  OR  ttc<=60s + pnl<-15%
+    if POSITION_STOP_LOSS_LATE_PNL_ENABLED and seconds_to_close is not None and ticker:
+        pnl_pct = ((current_price - entry_price - fee_per_contract) / entry_price * 100.0) if entry_price > 0 else 0.0
+        late_trigger = False
+        late_band = ""
+        if seconds_to_close <= 30 and pnl_pct < -8.0:
+            late_trigger = True
+            late_band = "ttc<=30s / pnl<-8%"
+        elif seconds_to_close <= 60 and pnl_pct < -15.0:
+            late_trigger = True
+            late_band = "ttc<=60s / pnl<-15%"
+        if late_trigger:
+            reason_lp = (
+                f"late-stage PnL stop: {late_band} "
+                f"(entry=${entry_price:.3f}, bid=${current_price:.3f}, "
+                f"pnl_pct={pnl_pct:.1f}%, ttc={seconds_to_close:.0f}s)"
+            )
+            log_sl_event("late_pnl_stop_triggered", ticker=ticker, direction=direction,
+                         contracts=contracts, entry_price=entry_price, bid=current_price,
+                         pnl_pct=round(pnl_pct, 2), ttc=round(seconds_to_close, 1),
+                         band=late_band, bid_size=bid_size)
+            return True, "late_pnl_stop", reason_lp
+
+    # === 3b. Bid stagnation exit: frozen orderbook while underwater ===
+    # Data-driven: mark unchanged ±$0.01 for >=45s AND pnl<-3% AND ttc<=120s
+    # Catches 5/12 losses (3 overlap with late-stage), 0/40 false triggers.
+    if seconds_to_close is not None and ticker:
+        now_mono = time.monotonic()
+        with _STATE_LOCK:
+            if ticker not in MARK_HISTORY:
+                MARK_HISTORY[ticker] = deque(maxlen=60)
+            MARK_HISTORY[ticker].append((now_mono, current_price))
+            if seconds_to_close <= POSITION_STOP_LOSS_STAGNATION_TTC_MAX:
+                pnl_pct_stag = ((current_price - entry_price - fee_per_contract) / entry_price * 100.0) if entry_price > 0 else 0.0
+                if pnl_pct_stag < POSITION_STOP_LOSS_STAGNATION_PNL_PCT:
+                    cutoff = now_mono - POSITION_STOP_LOSS_STAGNATION_SECONDS
+                    history = list(MARK_HISTORY[ticker])
+                    has_old = any(t <= cutoff for t, m in history)
+                    if has_old:
+                        window_marks = [(t, m) for t, m in history if t >= cutoff]
+                        if window_marks and all(abs(m - current_price) <= 0.01 for t, m in window_marks):
+                            span = now_mono - window_marks[0][0]
+                            reason_stag = (
+                                f"bid stagnation: mark frozen ±$0.01 for {span:.0f}s while underwater "
+                                f"(entry=${entry_price:.3f}, mark=${current_price:.3f}, "
+                                f"pnl_pct={pnl_pct_stag:.1f}%, ttc={seconds_to_close:.0f}s)"
+                            )
+                            log_sl_event("stagnation_exit_triggered", ticker=ticker, direction=direction,
+                                         contracts=contracts, entry_price=entry_price, bid=current_price,
+                                         pnl_pct=round(pnl_pct_stag, 2), ttc=round(seconds_to_close, 1),
+                                         stagnation_seconds=round(span, 1), bid_size=bid_size)
+                            return True, "bid_stagnation", reason_stag
+
+    # === 4. Hard stop: configured % loss on original position value ===
+    # Uses raw price (not EMA) — sustained wait handles noise filtering
+    if position_value > 0 and unrealized_pnl <= -(position_value * POSITION_STOP_LOSS_PERCENT):
+        reason = (
+            f"hard stop: position lost {POSITION_STOP_LOSS_PERCENT:.0%}+ of entry value "
             f"(entry_value=${position_value:.2f}, pnl=${unrealized_pnl:.2f}, "
             f"entry=${entry_price:.3f}, bid=${current_price:.3f})"
         )
+        log_sl_event("hard_stop_triggered", ticker=ticker, direction=direction,
+                     contracts=contracts, entry_price=entry_price, bid=current_price,
+                     pnl=round(unrealized_pnl, 4), position_value=round(position_value, 4),
+                     threshold=POSITION_STOP_LOSS_PERCENT, bid_size=bid_size,
+                     ema=round(smoothed_bid, 4) if ticker else None)
+        return True, "stop_loss", reason
+
+    # === 5. Momentum reversal for longer-duration markets ===
+    if ticker:
+        is_short_market = any(x in ticker for x in ["15M", "5M", "10M"])
+        if not is_short_market:
+            with _STATE_LOCK:
+                peak_value = TRAILING_PEAK.get(ticker)
+            if peak_value is not None and peak_value > 0:
+                drop_from_peak = (peak_value - current_smoothed_value) / peak_value
+
+                # Track bid sizes for shrinking detection
+                with _STATE_LOCK:
+                    if ticker not in RECENT_BID_SIZES:
+                        RECENT_BID_SIZES[ticker] = deque(maxlen=8)
+                    RECENT_BID_SIZES[ticker].append(bid_size)
+                    recent_list = list(RECENT_BID_SIZES[ticker])
+
+                bid_shrinking = False
+                if len(recent_list) >= 6:
+                    avg_bid_size = sum(recent_list) / len(recent_list)
+                    # Require meaningful average liquidity — low avg means illiquid, not reversing
+                    if avg_bid_size >= 50:
+                        current_is_much_lower = bid_size <= 0.60 * avg_bid_size
+                        downward_trend = (len(recent_list) >= 3 and
+                                         recent_list[-3] > recent_list[-2] > recent_list[-1])
+                        bid_shrinking = current_is_much_lower and downward_trend
+
+                if drop_from_peak >= POSITION_STOP_LOSS_MOMENTUM_DROP and bid_shrinking:
+                    reason_mr = (
+                        f"momentum reversal: {drop_from_peak:.1%} drop from peak with shrinking bids "
+                        f"(peak_value=${peak_value:.2f}, current=${current_smoothed_value:.2f}, "
+                        f"bid_size={bid_size}, recent_avg={sum(recent_list)/len(recent_list):.0f})"
+                    )
+                    log_sl_event("momentum_reversal_triggered", ticker=ticker, direction=direction,
+                                 contracts=contracts, entry_price=entry_price, bid=current_price,
+                                 ema=round(smoothed_bid, 4), peak_value=round(peak_value, 2),
+                                 current_smoothed=round(current_smoothed_value, 2),
+                                 drop_pct=round(drop_from_peak, 4), bid_size=bid_size,
+                                 recent_bids=recent_list)
+                    return True, "momentum_reversal", reason_mr
 
     return False, None, None
 
@@ -197,6 +440,35 @@ def handle_orderbook_ws(ticker, msg_type, data):
                 else:
                     existing[side][price] = new_size
                 WS_ORDERBOOKS[ticker] = existing
+
+    # === Orderbook momentum guard: detect large opposite-side delta spikes ===
+    # Only count POSITIVE deltas near the top of the book (within 10¢ of best bid).
+    # Positive delta = new bids placed (real pressure). Negative = cancellations (not pressure).
+    # Bottom-of-book activity (e.g. 51K contracts at $0.01) is cleanup, not pressure.
+    if msg_type == "orderbook_delta":
+        side = data.get("side", "")
+        raw_delta = float(data.get("delta_fp", 0))
+        delta_price = float(data.get("price_dollars", 0))
+        if side in ("yes", "no") and raw_delta >= MOMENTUM_GUARD_DELTA_FLOOR:
+            # Check if delta is near the best bid (top of book)
+            with _BOOK_LOCK:
+                book = WS_ORDERBOOKS.get(ticker, {}).get(side, {})
+                best_price = max(book.keys()) if book else 0
+                best_bid_size = book.get(best_price, 0) if best_price else 0
+            near_top = best_price > 0 and (best_price - delta_price) <= 0.10
+            dynamic_threshold = max(MOMENTUM_GUARD_DELTA_FLOOR, best_bid_size * MOMENTUM_GUARD_BEST_BID_RATIO)
+            if near_top and raw_delta >= dynamic_threshold:
+                with _STATE_LOCK:
+                    OPPOSITE_PRESSURE_SIGNALS[ticker] = {
+                        "side": side,
+                        "delta": raw_delta,
+                        "time": time.monotonic(),
+                    }
+                logger.info(
+                    f"[MOMENTUM_GUARD] Large {side.upper()} delta on {ticker} at ${delta_price:.2f}: "
+                    f"+{raw_delta:.0f} contracts (best=${best_price:.2f}x{best_bid_size:.0f}, "
+                    f"threshold={dynamic_threshold:.0f} = max({MOMENTUM_GUARD_DELTA_FLOOR}, {MOMENTUM_GUARD_BEST_BID_RATIO:.0%}x{best_bid_size:.0f}))"
+                )
 
     # Build sorted arrays and push to REALTIME_QUOTES
     with _BOOK_LOCK:
@@ -905,6 +1177,9 @@ def _execute_exit(ticker, direction, contracts, entry_price, entry_fees, trigger
 
         if not order_filled:
             PENDING_CLOSE_UNTIL.pop(close_key, None)
+            log_sl_event("exit_failed", ticker=ticker, trigger=trigger, direction=direction,
+                         contracts=contracts, entry_price=entry_price,
+                         reason="all_ioc_attempts_failed")
             return
 
         # Fetch actual fill price and fees from exchange
@@ -928,6 +1203,11 @@ def _execute_exit(ticker, direction, contracts, entry_price, entry_fees, trigger
             f"entry=${entry_price:.4f} | exit=${exit_price:.4f} | fees=${entry_fees + exit_fees:.2f} | "
             f"pnl=${realized_pnl:.2f} ({realized_pnl_pct:.2f}%) | order={json.dumps(order_body)}"
         )
+        log_sl_event("exit_executed", ticker=ticker, trigger=trigger, direction=direction,
+                     contracts=contracts, entry_price=entry_price, exit_price=round(exit_price, 4),
+                     entry_fees=round(entry_fees, 4), exit_fees=round(exit_fees, 4),
+                     realized_pnl=round(realized_pnl, 4), realized_pnl_pct=round(realized_pnl_pct, 4),
+                     order_status=order_status, reason=exit_reason)
 
         # Own DB connection for thread safety
         conn = sqlite3.connect("trades.db", timeout=5)
@@ -942,6 +1222,13 @@ def _execute_exit(ticker, direction, contracts, entry_price, entry_fees, trigger
         # Clean state for closed position
         with _STATE_LOCK:
             STOP_LOSS_BREACH_START.pop(ticker, None)
+            TRAILING_EMA.pop(ticker, None)
+            TRAILING_PEAK.pop(ticker, None)
+            RECENT_BID_SIZES.pop(ticker, None)
+            OPPOSITE_PRESSURE_SIGNALS.pop(ticker, None)
+            EMA_UPDATE_COUNT.pop(ticker, None)
+            # Record SL exit cooldown so other bots can check before re-entering
+            SL_EXIT_COOLDOWN[ticker] = time.monotonic()
 
         if trigger == "stop_loss" and realized_pnl_pct < -20.0:
             logger.error(f"ALERT: Close order for {ticker} executed with severe loss {realized_pnl_pct:.2f}%")
@@ -1105,6 +1392,8 @@ def monitor_positions_once():
 
 
         current_price = executable_quote["bid"]
+        bid_size = int(executable_quote.get("size", 0))
+        is_inferred_quote = "inferred" in executable_quote.get("source", "")
 
         # Compute per-contract fee (entry + estimated exit)
         # Estimate exit fee ≈ entry fee per contract (same Kalshi rate applies both sides)
@@ -1121,49 +1410,124 @@ def monitor_positions_once():
         # Compute total market duration for proportional hold gate
         market_duration_seconds = _compute_market_duration(market.get("open_time"), market.get("close_time"))
 
-        # Smart exit decision
+        # Smart exit decision (hard stop + EMA momentum reversal)
         should_exit, trigger, exit_reason = compute_smart_exit(
             entry_price, current_price, direction, seconds_to_close, market_duration_seconds,
-            fee_per_contract=fee_per_contract, contracts=contracts
+            fee_per_contract=fee_per_contract, contracts=contracts,
+            bid_size=bid_size, ticker=ticker
         )
 
-        # Stop-loss: track breach duration, auto-execute after 2s sustained breach
-        # Severe breaches (75%+ loss) still exit immediately
-        severe_breach = False
+        # Stop-loss breach timing: sustained breach or severe → auto-execute
+        # Momentum reversal & edge erosion require 15s sustained wait to filter flash crashes
         auto_execute_sl = False
-        if should_exit and trigger == "stop_loss":
-            # Severity check: 85%+ loss is severe — exit immediately
+        if should_exit and trigger in ("stop_loss", "momentum_reversal", "edge_erosion", "late_pnl_stop", "bid_stagnation"):
             total_fees = fee_per_contract * contracts
-            unrealized_pnl = contracts * (current_price - entry_price) - total_fees
             position_value = contracts * entry_price
-            severe_breach = position_value > 0 and unrealized_pnl <= -(position_value * 0.85)
+            raw_pnl = contracts * (current_price - entry_price) - total_fees
 
-            if severe_breach:
+            if trigger == "late_pnl_stop":
+                # Late PnL stop: near expiration + deep loss — bypass liquidity gate entirely.
+                # Even a bad fill or failed IOC is better than riding to settlement.
                 logger.warning(
-                    f"[EXIT] SEVERE: {ticker} | pnl=${unrealized_pnl:.2f} vs entry_value=${position_value:.2f} — "
-                    f"skipping confirmation, exiting immediately"
+                    f"[EXIT] LATE_PNL_STOP on {ticker} — bypassing liquidity gate "
+                    f"(bid_size={bid_size}, ttc={seconds_to_close:.0f}s, pnl={raw_pnl:.2f})"
                 )
-                exit_reason = f"{exit_reason} (severe breach — immediate exit)"
+                log_sl_event("late_pnl_bypass_liquidity", ticker=ticker, direction=direction,
+                             contracts=contracts, entry_price=entry_price, bid=current_price,
+                             pnl=round(raw_pnl, 4), ttc=round(seconds_to_close, 1) if seconds_to_close else 0,
+                             bid_size=bid_size)
                 auto_execute_sl = True
-            else:
-                now_mono = time.monotonic()
-                with _STATE_LOCK:
-                    if ticker not in STOP_LOSS_BREACH_START:
-                        STOP_LOSS_BREACH_START[ticker] = now_mono
-                    breach_elapsed = now_mono - STOP_LOSS_BREACH_START[ticker]
-                if breach_elapsed < 3.0:
-                    logger.warning(
-                        f"[EXIT] BREACH_WAIT: {ticker} | stop-loss breach for {breach_elapsed:.1f}s / 3.0s | "
-                        f"{exit_reason} — waiting for sustained breach"
-                    )
-                    should_exit = False
-                    trigger = None
-                    exit_reason = None
+            elif trigger in ("stop_loss", "edge_erosion", "bid_stagnation", "momentum_reversal"):
+                # Severity check: configured severe % → exit immediately (hard stop only)
+                severe_breach = (
+                    trigger == "stop_loss"
+                    and position_value > 0
+                    and raw_pnl <= -(position_value * POSITION_STOP_LOSS_SEVERE_PERCENT)
+                )
+
+                if severe_breach:
+                    if bid_size >= POSITION_STOP_LOSS_MIN_BID_SIZE or is_inferred_quote:
+                        logger.warning(
+                            f"[EXIT] SEVERE: {ticker} | pnl=${raw_pnl:.2f} vs entry_value=${position_value:.2f} — "
+                            f"skipping wait, exiting immediately{' (inferred quote)' if is_inferred_quote else ''}"
+                        )
+                        log_sl_event("severe_breach_exit", ticker=ticker, direction=direction,
+                                     contracts=contracts, entry_price=entry_price, bid=current_price,
+                                     pnl=round(raw_pnl, 4), position_value=round(position_value, 4),
+                                     severe_pct=POSITION_STOP_LOSS_SEVERE_PERCENT, bid_size=bid_size,
+                                     inferred=is_inferred_quote)
+                        exit_reason = f"{exit_reason} (severe breach — immediate exit)"
+                        auto_execute_sl = True
+                    else:
+                        logger.warning(
+                            f"[EXIT] SEVERE breach on {ticker} but low liquidity "
+                            f"(bid_size={bid_size} < min={POSITION_STOP_LOSS_MIN_BID_SIZE}) — holding"
+                        )
+                        log_sl_event("severe_breach_blocked", ticker=ticker, reason="low_liquidity",
+                                     bid_size=bid_size, min_bid_size=POSITION_STOP_LOSS_MIN_BID_SIZE,
+                                     pnl=round(raw_pnl, 4))
+                        should_exit = False
+                        trigger = None
+                        exit_reason = None
                 else:
-                    exit_reason = f"{exit_reason} (sustained {breach_elapsed:.1f}s — auto-executing)"
-                    auto_execute_sl = True
-        elif trigger != "stop_loss":
-            # Price recovered above stop — reset breach timer
+                    # Normal breach: require sustained duration
+                    # Check for opposite-side orderbook pressure to accelerate
+                    now_mono = time.monotonic()
+                    opposite_side = "no" if direction == "YES" else "yes"
+                    has_pressure = False
+                    with _STATE_LOCK:
+                        if ticker not in STOP_LOSS_BREACH_START:
+                            STOP_LOSS_BREACH_START[ticker] = now_mono
+                        breach_elapsed = now_mono - STOP_LOSS_BREACH_START[ticker]
+                        sig = OPPOSITE_PRESSURE_SIGNALS.get(ticker)
+                        if sig and sig["side"] == opposite_side:
+                            if (now_mono - sig["time"]) <= MOMENTUM_GUARD_WINDOW_SECONDS:
+                                has_pressure = True
+                    effective_wait = MOMENTUM_GUARD_ACCELERATED_WAIT if has_pressure else POSITION_STOP_LOSS_SUSTAINED_SECONDS
+                    # Edge erosion & momentum reversal get a longer sustained wait (15s) to filter flash crashes.
+                    # Flash bid drops often recover within seconds; requiring 15s of sustained
+                    # breach before executing prevents false exits from transient liquidity gaps.
+                    if trigger in ("edge_erosion", "momentum_reversal") and not has_pressure:
+                        effective_wait = max(effective_wait, 15.0)
+                    if breach_elapsed < effective_wait:
+                        pressure_tag = f" [MOMENTUM_GUARD: {opposite_side.upper()} pressure → wait={effective_wait:.0f}s]" if has_pressure else ""
+                        logger.warning(
+                            f"[EXIT] BREACH_WAIT: {ticker} | stop-loss breach for {breach_elapsed:.1f}s / "
+                            f"{effective_wait:.0f}s | {exit_reason}{pressure_tag} — waiting"
+                        )
+                        log_sl_event("breach_waiting", ticker=ticker, direction=direction,
+                                     contracts=contracts, entry_price=entry_price, bid=current_price,
+                                     pnl=round(raw_pnl, 4), breach_elapsed=round(breach_elapsed, 2),
+                                     effective_wait=effective_wait, has_pressure=has_pressure,
+                                     pressure_side=opposite_side if has_pressure else None,
+                                     bid_size=bid_size)
+                        should_exit = False
+                        trigger = None
+                        exit_reason = None
+                    else:
+                        if bid_size >= POSITION_STOP_LOSS_MIN_BID_SIZE or is_inferred_quote:
+                            pressure_note = f" [MOMENTUM_GUARD accelerated from {POSITION_STOP_LOSS_SUSTAINED_SECONDS:.0f}s→{effective_wait:.0f}s]" if has_pressure else ""
+                            log_sl_event("breach_sustained_exit", ticker=ticker, direction=direction,
+                                         contracts=contracts, entry_price=entry_price, bid=current_price,
+                                         pnl=round(raw_pnl, 4), breach_elapsed=round(breach_elapsed, 2),
+                                         effective_wait=effective_wait, has_pressure=has_pressure,
+                                         pressure_side=opposite_side if has_pressure else None,
+                                         bid_size=bid_size)
+                            exit_reason = f"{exit_reason} (sustained {breach_elapsed:.1f}s{pressure_note} — auto-executing)"
+                            auto_execute_sl = True
+                        else:
+                            logger.warning(
+                                f"[EXIT] Stop-loss sustained on {ticker} but low liquidity "
+                                f"(bid_size={bid_size} < min={POSITION_STOP_LOSS_MIN_BID_SIZE}) — holding"
+                            )
+                            log_sl_event("breach_sustained_blocked", ticker=ticker, reason="low_liquidity",
+                                         bid_size=bid_size, min_bid_size=POSITION_STOP_LOSS_MIN_BID_SIZE,
+                                         breach_elapsed=round(breach_elapsed, 2), pnl=round(raw_pnl, 4))
+                            should_exit = False
+                            trigger = None
+                            exit_reason = None
+        elif trigger is None:
+            # No exit triggered — reset breach timer
             with _STATE_LOCK:
                 STOP_LOSS_BREACH_START.pop(ticker, None)
 
@@ -1195,14 +1559,15 @@ def monitor_positions_once():
             f"reason={exit_reason}"
         )
 
-        # --- Auto-execute stop-loss (no approval needed) ---
+        # --- Auto-execute stop-loss / momentum reversal (no approval needed) ---
         if auto_execute_sl:
-            logger.warning(f"[EXIT] AUTO-EXECUTING stop-loss for {ticker} — no Discord approval required")
+            trigger_label = {"stop_loss": "stop-loss", "momentum_reversal": "momentum-reversal", "edge_erosion": "edge-erosion", "late_pnl_stop": "late-pnl-stop", "bid_stagnation": "bid-stagnation"}.get(trigger, trigger)
+            logger.warning(f"[EXIT] AUTO-EXECUTING {trigger_label} for {ticker} — no Discord approval required")
             # Notify Discord (info only, not an approval request)
             if discord_bot.is_configured():
                 discord_bot.send_exit_result(
                     ticker=ticker,
-                    trigger="stop_loss",
+                    trigger=trigger,
                     direction=direction,
                     contracts=contracts,
                     entry_price=entry_price,
@@ -1261,6 +1626,19 @@ def monitor_positions_once():
 
         _execute_exit(ticker, direction, contracts, entry_price, entry_fees, trigger, exit_reason, close_key)
 
+    # Clean up stale tracking state for positions no longer open
+    open_tickers = {p.get("ticker") for p in positions if p.get("ticker")}
+    with _STATE_LOCK:
+        for d in [TRAILING_EMA, TRAILING_PEAK, STOP_LOSS_BREACH_START, RECENT_BID_SIZES, OPPOSITE_PRESSURE_SIGNALS, MARK_HISTORY, EMA_UPDATE_COUNT]:
+            for k in list(d.keys()):
+                if k not in open_tickers:
+                    d.pop(k, None)
+        # Clean expired SL cooldowns (> 10 minutes old)
+        now_mono = time.monotonic()
+        for k in list(SL_EXIT_COOLDOWN.keys()):
+            if now_mono - SL_EXIT_COOLDOWN[k] > 600:
+                SL_EXIT_COOLDOWN.pop(k, None)
+
     conn.close()
 
 def monitor_positions():
@@ -1268,6 +1646,13 @@ def monitor_positions():
     logger.info(
         f"Starting position monitor loop | exit_strategy=smart_binary | "
         f"interval={MONITOR_INTERVAL_SECONDS}s | "
+        f"stop_loss={'enabled' if POSITION_STOP_LOSS_ENABLED else 'DISABLED'} | "
+        f"sl_threshold={POSITION_STOP_LOSS_PERCENT:.0%} | severe={POSITION_STOP_LOSS_SEVERE_PERCENT:.0%} | "
+        f"edge_erosion={POSITION_STOP_LOSS_EDGE_EROSION_PCT:.0%} | "
+        f"late_pnl={'enabled' if POSITION_STOP_LOSS_LATE_PNL_ENABLED else 'DISABLED'} (30s/-8%, 60s/-15%) | "
+        f"stagnation={POSITION_STOP_LOSS_STAGNATION_SECONDS:.0f}s / pnl<{POSITION_STOP_LOSS_STAGNATION_PNL_PCT}% / ttc<={POSITION_STOP_LOSS_STAGNATION_TTC_MAX}s | "
+        f"sustained={POSITION_STOP_LOSS_SUSTAINED_SECONDS}s | momentum_drop={POSITION_STOP_LOSS_MOMENTUM_DROP:.0%} | "
+        f"min_bid_size={POSITION_STOP_LOSS_MIN_BID_SIZE} | "
         f"hold_for_settlement={SETTLEMENT_HOLD_ENABLED} | settlement_window={SETTLEMENT_HOLD_SECONDS}s"
     )
     while True:

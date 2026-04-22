@@ -155,6 +155,18 @@ def ensure_trade_table_columns():
 
 ensure_trade_table_columns()
 
+def get_recent_sl_exits(minutes=5):
+    """Return set of tickers that had a stop-loss exit in the last N minutes."""
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT DISTINCT market_ticker FROM trades "
+        "WHERE status = 'CLOSED' "
+        "AND reason LIKE '%closed by %' "
+        "AND resolved_timestamp >= datetime('now', ?)",
+        (f'-{minutes} minutes',),
+    )
+    return {row[0] for row in cursor.fetchall()}
+
 daily_loss = 0.0
 daily_trade_count = 0
 _DAILY_LOCK = threading.Lock()
@@ -817,6 +829,25 @@ def main_loop():
                 side = "yes" if decision["direction"] == "YES" else "no"
                 action = "buy"
 
+                # Fee-aware filter: skip if max profit per contract can't cover round-trip fees
+                dominant_price = yes_price if side == "yes" else no_price
+                max_profit_per_contract = 1.0 - dominant_price
+                if max_profit_per_contract <= 0.05:
+                    logger.info(
+                        f"   → Skipping {ticker}: max profit ${max_profit_per_contract:.3f}/contract "
+                        f"<= $0.05 (fee-unprofitable at entry ${dominant_price:.3f})"
+                    )
+                    continue
+
+                # SL re-entry cooldown: skip tickers stopped out in last 5 minutes
+                try:
+                    sl_cooldowns = get_recent_sl_exits(minutes=5)
+                    if ticker in sl_cooldowns:
+                        logger.info(f"   → Skipping {ticker}: recent SL exit cooldown (5 min)")
+                        continue
+                except Exception:
+                    pass  # DB query failed — proceed with trade
+
                 # Use the ASK price (what sellers are offering) so IOC orders
                 # actually match resting liquidity.  Fall back to midpoint if
                 # no ask is available, and add 1¢ slippage to handle tiny
@@ -831,17 +862,6 @@ def main_loop():
                 limit_price_dollars = limit_price_cents / 100.0
                 # Number of contracts to buy, derived from the size computed in the decision engine.
                 count = int(decision["size"] * 100)
-
-                # Ultra-high probability: allocate 50% of available cash instead of normal sizing
-                if decision.get("half_cash_sizing") and limit_price_dollars > 0:
-                    half_cash_count = int((cash * 0.50) / limit_price_dollars)
-                    if half_cash_count > count:
-                        logger.info(
-                            f"[SIZING] Ultra-high probability override for {ticker}: "
-                            f"normal={count} contracts → 50% cash={half_cash_count} contracts "
-                            f"(cash=${cash:.2f}, limit=${limit_price_dollars:.4f})"
-                        )
-                        count = half_cash_count
 
                 total_order_cost = count * limit_price_dollars
 

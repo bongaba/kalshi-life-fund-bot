@@ -150,3 +150,35 @@ def setup_trade_decision_log(rotation: str = "1 day") -> Path:
         _CONFIGURED_LOG_FILES.add(log_path)
 
     return log_path
+
+
+def setup_stop_loss_log(rotation: str = "1 day") -> Path:
+    """Add a JSON-lines sink for structured stop-loss events (backtesting/analysis).
+
+    Each line is a JSON object with fields like:
+      event, timestamp, ticker, direction, contracts, entry_price, bid, pnl,
+      trigger, outcome, details...
+    """
+    family_dir = LOGS_DIR / "stop_loss"
+    family_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_path = family_dir / f"stop_loss.{timestamp}_pid{os.getpid()}.jsonl"
+
+    def _sl_filter(record):
+        return record["extra"].get("sl_log") is True
+
+    def _sl_format(record):
+        # Write raw message (pre-formatted JSON) + newline
+        return "{message}\n"
+
+    if log_path not in _CONFIGURED_LOG_FILES:
+        logger.add(
+            str(log_path),
+            filter=_sl_filter,
+            format=_sl_format,
+            rotation=rotation,
+            enqueue=True,
+        )
+        _CONFIGURED_LOG_FILES.add(log_path)
+
+    return log_path
