@@ -294,8 +294,16 @@ def send_exit_result(
 _PAUSE_FLAGS = {
     "execution": False,
     "monitor": False,
+    "scanner_buy": False,  # block scanner from placing trades while still collecting signals
 }
 _PAUSE_LOCK = threading.Lock()
+
+# Runtime feature toggles — overrides static config when set.
+# None = "use config default"; True/False = explicit override.
+_FEATURE_OVERRIDES = {
+    "tiering": None,  # edge scanner position-size tiering
+}
+_FEATURE_LOCK = threading.Lock()
 
 # Track the last message ID we've processed so we don't replay old commands
 _LAST_PROCESSED_MSG_ID = None
@@ -313,6 +321,19 @@ def is_paused(component: str) -> bool:
 def _set_pause(component: str, paused: bool):
     with _PAUSE_LOCK:
         _PAUSE_FLAGS[component] = paused
+
+
+def is_feature_enabled(name: str, default: bool) -> bool:
+    """Return runtime override for a feature toggle, falling back to `default` (typically the config value)."""
+    with _FEATURE_LOCK:
+        override = _FEATURE_OVERRIDES.get(name)
+    return default if override is None else override
+
+
+def _set_feature(name: str, value):
+    """Set a runtime feature override. Pass None to clear (revert to config default)."""
+    with _FEATURE_LOCK:
+        _FEATURE_OVERRIDES[name] = value
 
 
 def _send_message(content: str):
@@ -363,6 +384,40 @@ def _handle_command(text: str):
             logger.warning("[DISCORD_CMD] ALL bots PAUSED by user")
             return True
 
+    elif cmd in ("!stop", "!halt"):
+        # Shortcut: pause everything
+        _set_pause("execution", True)
+        _set_pause("monitor", True)
+        _reply("🛑 **STOPPED** — execution and monitor PAUSED. Use `!start` to resume.")
+        logger.warning("[DISCORD_CMD] STOPPED (all paused) by user")
+        return True
+
+    elif cmd in ("!start", "!go"):
+        # Shortcut: resume everything
+        _set_pause("execution", False)
+        _set_pause("monitor", False)
+        _reply("🟢 **STARTED** — execution and monitor RESUMED.")
+        logger.info("[DISCORD_CMD] STARTED (all resumed) by user")
+        return True
+
+    elif cmd in ("!scanner-buy", "!scanner_buy", "!buy"):
+        # Pause / resume the orderbook scanner from placing trades while it keeps collecting edge signals.
+        if arg in ("off", "pause", "stop", "disable"):
+            _set_pause("scanner_buy", True)
+            _reply("⏸️ **Scanner buying PAUSED** — edge signals will still be collected, but no new trades will be placed. Use `!scanner-buy on` to resume.")
+            logger.warning("[DISCORD_CMD] Scanner BUY paused (signal collection continues)")
+            return True
+        elif arg in ("on", "resume", "start", "enable"):
+            _set_pause("scanner_buy", False)
+            _reply("▶️ **Scanner buying RESUMED** — new trades will be placed again.")
+            logger.info("[DISCORD_CMD] Scanner BUY resumed")
+            return True
+        elif arg in ("status", ""):
+            with _PAUSE_LOCK:
+                paused = _PAUSE_FLAGS.get("scanner_buy", False)
+            _reply(f"Scanner buying: {'⏸️ PAUSED (signals still collected)' if paused else '▶️ ACTIVE'}")
+            return True
+
     elif cmd == "!resume":
         if arg in ("execution", "bot"):
             _set_pause("execution", False)
@@ -385,19 +440,67 @@ def _handle_command(text: str):
         with _PAUSE_LOCK:
             exec_status = "⏸️ PAUSED" if _PAUSE_FLAGS["execution"] else "▶️ RUNNING"
             mon_status = "⏸️ PAUSED" if _PAUSE_FLAGS["monitor"] else "▶️ RUNNING"
-        _reply(f"**Bot Status**\nExecution bot: {exec_status}\nPosition monitor: {mon_status}")
+            buy_status = "⏸️ PAUSED (signals still logged)" if _PAUSE_FLAGS.get("scanner_buy") else "▶️ ACTIVE"
+        with _FEATURE_LOCK:
+            tier_override = _FEATURE_OVERRIDES.get("tiering")
+        if tier_override is None:
+            tier_status = "config default"
+        else:
+            tier_status = "✅ ON (override)" if tier_override else "❌ OFF (override)"
+        _reply(
+            f"**Bot Status**\n"
+            f"Execution bot: {exec_status}\n"
+            f"Position monitor: {mon_status}\n"
+            f"Scanner buying: {buy_status}\n"
+            f"Edge tiering: {tier_status}"
+        )
         return True
 
-    elif cmd == "!help":
+    elif cmd == "!tiering":
+        if arg in ("on", "enable", "true"):
+            _set_feature("tiering", True)
+            _reply("✅ **Edge tiering ENABLED** — premium signals get 2× position size.")
+            logger.warning("[DISCORD_CMD] Edge tiering ENABLED by user")
+            return True
+        elif arg in ("off", "disable", "false"):
+            _set_feature("tiering", False)
+            _reply("❌ **Edge tiering DISABLED** — all signals use flat $20 risk.")
+            logger.warning("[DISCORD_CMD] Edge tiering DISABLED by user")
+            return True
+        elif arg in ("default", "reset", "clear"):
+            _set_feature("tiering", None)
+            _reply("🔄 **Edge tiering reset to config default** (`EDGE_SCANNER_TIERING_ENABLED` from .env).")
+            logger.info("[DISCORD_CMD] Edge tiering reset to config default")
+            return True
+        elif arg in ("status", ""):
+            with _FEATURE_LOCK:
+                override = _FEATURE_OVERRIDES.get("tiering")
+            if override is None:
+                _reply("Edge tiering: using config default (`EDGE_SCANNER_TIERING_ENABLED`).")
+            else:
+                _reply(f"Edge tiering override: {'✅ ON' if override else '❌ OFF'}")
+            return True
+
+    elif cmd in ("!help", "!commands", "!?"):
         _reply(
-            "**Available commands:**\n"
-            "`!pause execution` — pause trade execution\n"
-            "`!pause monitor` — pause position monitor\n"
-            "`!pause all` — pause everything\n"
-            "`!resume execution` — resume trade execution\n"
-            "`!resume monitor` — resume position monitor\n"
-            "`!resume all` — resume everything\n"
-            "`!status` — show current bot status"
+            "**🤖 Bot Commands**\n"
+            "\n"
+            "**Quick controls**\n"
+            "`!stop` — pause everything (execution + monitor)\n"
+            "`!start` — resume everything\n"
+            "`!status` — show current state\n"
+            "\n"
+            "**Granular pause/resume**\n"
+            "`!pause execution|monitor|all`\n"
+            "`!resume execution|monitor|all`\n"
+            "\n"
+            "**Scanner buying** (signals keep being collected when paused)\n"
+            "`!scanner-buy off|on|status`\n"
+            "\n"
+            "**Edge tiering** (premium signals get 2× position size)\n"
+            "`!tiering on|off|default|status`\n"
+            "\n"
+            "`!help` — show this message"
         )
         return True
 

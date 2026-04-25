@@ -1,0 +1,156 @@
+==============================================================================================================
+  STOP LOSS SIMULATION — S4 Strategy (Unfiltered, Entry $0.30-$0.70)
+  Using subsequent signal snapshots as price checks
+  Bankroll: $1,000 | Risk/trade: $100 | Trades with price data: 350/472
+==============================================================================================================
+
+  PRICE-BASED STOP LOSSES
+  Exit if our side's price drops by X% from entry price
+  Stop Level                |       ROI |     End Bal |  Max DD |              W/L |  Stopped |    $ Saved |     $ Cost |  Net Impact
+  ------------------------------------------------------------------------------------------------------------------------
+  No Stop Loss (baseline)   |   +275.3% | $ 3,752.77 |   56.0% | 295W/174L (63%) |       -- |         -- |         -- |          --
+  Stop at -10%              |   +357.6% | $ 4,575.86 |   35.0% | 274W/197L (58%) |      114 | $3,398.71 | $2,478.32 | $  +920.39
+  Stop at -15%              |   +351.4% | $ 4,513.97 |   34.0% | 275W/195L (59%) |      111 | $3,204.19 | $2,367.19 | $  +837.00
+  Stop at -20%              |   +301.0% | $ 4,009.54 |   37.3% | 276W/194L (59%) |      106 | $2,621.26 | $2,288.69 | $  +332.57
+  Stop at -25%              |   +315.0% | $ 4,149.75 |   37.3% | 279W/191L (59%) |      102 | $2,534.48 | $2,061.70 | $  +472.78
+  Stop at -30%              |   +308.8% | $ 4,088.46 |   39.9% | 281W/189L (60%) |       99 | $2,354.21 | $1,942.72 | $  +411.49
+  Stop at -40%              |   +312.7% | $ 4,126.92 |   42.3% | 285W/185L (61%) |       94 | $2,023.37 | $1,573.41 | $  +449.95
+  Stop at -50%              |   +305.9% | $ 4,059.13 |   46.5% | 287W/183L (61%) |       87 | $1,632.09 | $1,249.92 | $  +382.17
+  Stop at -80%              |   +299.7% | $ 3,997.08 |   49.5% | 295W/175L (63%) |       58 | $  417.01 | $  153.85 | $  +263.16
+
+
+  SCORE-BASED STOP LOSSES
+  Exit if subsequent signal score drops below threshold
+  Stop Level                |       ROI |     End Bal |  Max DD |              W/L |  Stopped |    $ Saved |     $ Cost |  Net Impact
+  ------------------------------------------------------------------------------------------------------------------------
+  No Stop Loss (baseline)   |   +275.3% | $ 3,752.77 |   56.0% | 295W/174L (63%) |       -- |         -- |         -- |          --
+  Score < 55                |   +275.3% | $ 3,752.77 |   56.0% | 295W/174L (63%) |        0 | $    0.00 | $    0.00 | $    +0.00
+  Score < 50                |   +275.3% | $ 3,752.77 |   56.0% | 295W/174L (63%) |        0 | $    0.00 | $    0.00 | $    +0.00
+  Score < 45                |   +275.3% | $ 3,752.77 |   56.0% | 295W/174L (63%) |        0 | $    0.00 | $    0.00 | $    +0.00
+  Score < 40                |   +275.3% | $ 3,752.77 |   56.0% | 295W/174L (63%) |        0 | $    0.00 | $    0.00 | $    +0.00
+  Score < 35                |   +275.3% | $ 3,752.77 |   56.0% | 295W/174L (63%) |        0 | $    0.00 | $    0.00 | $    +0.00
+  Score < 30                |   +275.3% | $ 3,752.77 |   56.0% | 295W/174L (63%) |        0 | $    0.00 | $    0.00 | $    +0.00
+
+
+  COMBINED STOP LOSSES (price OR score trigger)
+  Stop Level                          |       ROI |     End Bal |  Max DD |              W/L |  Stopped |  Net Impact
+  --------------------------------------------------------------------------------------------------------------
+  -20% price OR score<50              |   +301.0% | $ 4,009.54 |   37.3% | 276W/194L (59%) |      106 | $  +332.57
+  -25% price OR score<50              |   +315.0% | $ 4,149.75 |   37.3% | 279W/191L (59%) |      102 | $  +472.78
+  -30% price OR score<45              |   +308.8% | $ 4,088.46 |   39.9% | 281W/189L (60%) |       99 | $  +411.49
+  -30% price OR score<40              |   +308.8% | $ 4,088.46 |   39.9% | 281W/189L (60%) |       99 | $  +411.49
+  -25% price OR score<45              |   +315.0% | $ 4,149.75 |   37.3% | 279W/191L (59%) |      102 | $  +472.78
+  -20% price OR score<45              |   +301.0% | $ 4,009.54 |   37.3% | 276W/194L (59%) |      106 | $  +332.57
+
+
+  STOP LOSS DETAIL — Baseline (no stop) vs Best Price Stop
+  Showing individual trade outcomes for stopped trades at -20%
+  Ticker                                   | Dir |  Entry |   Exit |   Drop | Settlement |       Action
+  ----------------------------------------------------------------------------------------------------
+  KXSOLD-26APR1017-T83.9999                |  NO | $0.35 | $0.07 |  78.9% |       LOSS |        SAVED
+  KXETHD-26APR1017-T2209.99                |  NO | $0.33 | $0.16 |  50.8% |       LOSS |        SAVED
+  KXBTC-26APR1017-B72750                   | YES | $0.47 | $0.15 |  69.5% |       LOSS |        SAVED
+  KXBTCD-26APR1018-T73099.99               |  NO | $0.58 | $0.23 |  61.5% |       LOSS |        SAVED
+  KXBTCD-26APR1100-T73099.99               |  NO | $0.69 | $0.52 |  25.4% |        WIN |   MISSED WIN
+  KXBTCD-26APR1101-T72799.99               |  NO | $0.55 | $0.30 |  44.0% |       LOSS |        SAVED
+  KXBTCD-26APR1104-T72799.99               | YES | $0.66 | $0.07 |  89.3% |       LOSS |        SAVED
+  KXBTCD-26APR1106-T72699.99               |  NO | $0.58 | $0.06 |  89.7% |       LOSS |        SAVED
+  KXBTC15M-26APR110715-15                  |  NO | $0.56 | $0.07 |  86.7% |       LOSS |        SAVED
+  KXBTCD-26APR1109-T72899.99               | YES | $0.64 | $0.43 |  31.5% |        WIN |   MISSED WIN
+  KXBTCD-26APR1110-T72899.99               | YES | $0.39 | $0.15 |  59.7% |       LOSS |        SAVED
+  KXBTCD-26APR1111-T72699.99               |  NO | $0.69 | $0.22 |  67.4% |       LOSS |        SAVED
+  KXBTCD-26APR1114-T73099.99               |  NO | $0.59 | $0.33 |  44.5% |       LOSS |        SAVED
+  KXBTCD-26APR1116-T73599.99               |  NO | $0.47 | $0.24 |  48.9% |       LOSS |        SAVED
+  KXBTC-26APR1116-B73650                   |  NO | $0.70 | $0.41 |  40.3% |        WIN |   MISSED WIN
+  KXBTC-26APR1117-B73375                   |  NO | $0.43 | $0.22 |  50.0% |       LOSS |        SAVED
+  KXBTCD-26APR1118-T73399.99               |  NO | $0.45 | $0.34 |  25.6% |       LOSS |        SAVED
+  KXBTCD-26APR1118-T73499.99               |  NO | $0.62 | $0.18 |  70.2% |        WIN |   MISSED WIN
+  KXBTCD-26APR1121-T73099.99               |  NO | $0.62 | $0.46 |  25.6% |       LOSS |        SAVED
+  KXBTCD-26APR1122-T71799.99               | YES | $0.42 | $0.26 |  39.3% |       LOSS |        SAVED
+  KXBTCD-26APR1202-T71699.99               |  NO | $0.62 | $0.10 |  84.0% |       LOSS |        SAVED
+  KXBTCD-26APR1205-T71699.99               |  NO | $0.50 | $0.35 |  29.0% |        WIN |   MISSED WIN
+  KXBTCD-26APR1206-T71599.99               | YES | $0.63 | $0.10 |  84.9% |       LOSS |        SAVED
+  KXBTC15M-26APR120600-00                  | YES | $0.58 | $0.10 |  83.8% |       LOSS |        SAVED
+  KXBTC15M-26APR120730-30                  | YES | $0.43 | $0.25 |  42.5% |       LOSS |        SAVED
+  KXBTCD-26APR1210-T70999.99               | YES | $0.52 | $0.16 |  70.2% |       LOSS |        SAVED
+  KXBTCD-26APR1211-T70999.99               | YES | $0.67 | $0.18 |  72.4% |       LOSS |        SAVED
+  KXBTCD-26APR1219-T70699.99               |  NO | $0.56 | $0.20 |  65.2% |       LOSS |        SAVED
+  KXBTC15M-26APR121930-30                  |  NO | $0.59 | $0.01 |  98.8% |       LOSS |        SAVED
+  KXBTCD-26APR1220-T70699.99               |  NO | $0.62 | $0.07 |  89.6% |       LOSS |        SAVED
+  KXBTC15M-26APR122000-00                  |  NO | $0.58 | $0.01 |  98.3% |       LOSS |        SAVED
+  KXBTCD-26APR1221-T70999.99               |  NO | $0.69 | $0.45 |  36.0% |       LOSS |        SAVED
+  KXBTCD-26APR1222-T71199.99               |  NO | $0.54 | $0.07 |  86.1% |       LOSS |        SAVED
+  KXBTCD-26APR1300-T71099.99               | YES | $0.66 | $0.47 |  28.0% |       LOSS |        SAVED
+  KXBTCD-26APR1300-T70999.99               |  NO | $0.68 | $0.19 |  71.9% |       LOSS |        SAVED
+  KXBTCD-26APR1305-T70699.99               | YES | $0.56 | $0.17 |  68.5% |       LOSS |        SAVED
+  KXBTC15M-26APR130600-00                  |  NO | $0.56 | $0.00 |  99.8% |       LOSS |        SAVED
+  KXBTCD-26APR1308-T70899.99               |  NO | $0.61 | $0.22 |  63.9% |       LOSS |        SAVED
+  KXBTCD-26APR1310-T71199.99               | YES | $0.48 | $0.23 |  53.6% |        WIN |   MISSED WIN
+  KXBTC15M-26APR130945-45                  | YES | $0.46 | $0.07 |  85.2% |       LOSS |        SAVED
+  KXBTCD-26APR1310-T71299.99               |  NO | $0.65 | $0.11 |  83.1% |       LOSS |        SAVED
+  KXBTCD-26APR1310-T70999.99               |  NO | $0.46 | $0.01 |  96.7% |       LOSS |        SAVED
+  KXBTCD-26APR1310-T71099.99               |  NO | $0.62 | $0.05 |  92.0% |       LOSS |        SAVED
+  KXBTCD-26APR1311-T71699.99               |  NO | $0.66 | $0.27 |  58.8% |       LOSS |        SAVED
+  KXWTI-26APR13-T103.99                    | YES | $0.33 | $0.21 |  34.8% |       LOSS |        SAVED
+  KXWTI-26APR13-T102.99                    | YES | $0.55 | $0.40 |  27.5% |       LOSS |        SAVED
+  KXBTCD-26APR1317-T71999.99               |  NO | $0.48 | $0.32 |  35.1% |       LOSS |        SAVED
+  KXWTI-26APR13-T101.99                    | YES | $0.60 | $0.34 |  42.5% |       LOSS |        SAVED
+  KXWTI-26APR13-T100.99                    | YES | $0.31 | $0.21 |  30.6% |       LOSS |        SAVED
+  KXWTI-26APR13-T99.99                     | YES | $0.45 | $0.29 |  36.7% |       LOSS |        SAVED
+  KXBTCD-26APR1317-T72749.99               |  NO | $0.66 | $0.23 |  64.4% |       LOSS |        SAVED
+  KXWTI-26APR13-T98.99                     | YES | $0.59 | $0.43 |  27.7% |        WIN |   MISSED WIN
+  KXBTCD-26APR1315-T72299.99               |  NO | $0.44 | $0.18 |  59.1% |       LOSS |        SAVED
+  KXBTCD-26APR1317-T72249.99               |  NO | $0.36 | $0.12 |  66.7% |       LOSS |        SAVED
+  KXBTCD-26APR1315-T72399.99               | YES | $0.58 | $0.41 |  29.9% |        WIN |   MISSED WIN
+  KXBTCD-26APR1316-T72799.99               |  NO | $0.68 | $0.17 |  75.6% |       LOSS |        SAVED
+  KXBTCD-26APR1316-T72599.99               |  NO | $0.39 | $0.06 |  84.4% |       LOSS |        SAVED
+  KXBTCD-26APR1316-T73099.99               |  NO | $0.55 | $0.02 |  96.4% |       LOSS |        SAVED
+  KXBTC15M-26APR141045-45                  | YES | $0.59 | $0.00 |  99.8% |       LOSS |        SAVED
+  KXBTCD-26APR1417-T75499.99               | YES | $0.35 | $0.23 |  35.7% |       LOSS |        SAVED
+  KXBTCD-26APR1417-T75249.99               |  NO | $0.54 | $0.42 |  22.4% |        WIN |   MISSED WIN
+  KXWTI-26APR14-T92.99                     | YES | $0.35 | $0.17 |  52.1% |       LOSS |        SAVED
+  KXBTCD-26APR1417-T74749.99               |  NO | $0.65 | $0.49 |  23.8% |        WIN |   MISSED WIN
+  KXWTI-26APR14-T91.99                     | YES | $0.49 | $0.36 |  27.3% |       LOSS |        SAVED
+  KXBTCD-26APR1415-T74599.99               | YES | $0.66 | $0.39 |  40.9% |       LOSS |        SAVED
+  KXBTCD-26APR1417-T74999.99               | YES | $0.30 | $0.19 |  36.7% |       LOSS |        SAVED
+  KXBTCD-26APR1415-T74699.99               | YES | $0.53 | $0.26 |  51.9% |       LOSS |        SAVED
+  KXBTCD-26APR1416-T74199.99               |  NO | $0.57 | $0.18 |  68.7% |       LOSS |        SAVED
+  KXBTCD-26APR1417-T74249.99               | YES | $0.46 | $0.15 |  66.7% |       LOSS |        SAVED
+  KXBTCD-26APR1418-T74199.99               | YES | $0.58 | $0.37 |  36.8% |        WIN |   MISSED WIN
+  KXBTCD-26APR1418-T74099.99               |  NO | $0.62 | $0.02 |  96.8% |       LOSS |        SAVED
+  KXBTCD-26APR1419-T73999.99               |  NO | $0.32 | $0.03 |  90.5% |       LOSS |        SAVED
+  KXBTCD-26APR1419-T74099.99               |  NO | $0.58 | $0.46 |  22.2% |        WIN |   MISSED WIN
+  KXBTCD-26APR1420-T74199.99               | YES | $0.45 | $0.07 |  84.3% |       LOSS |        SAVED
+  KXBTC15M-26APR142100-00                  | YES | $0.54 | $0.15 |  72.9% |        WIN |   MISSED WIN
+  KXBTCD-26APR1423-T74399.99               | YES | $0.66 | $0.23 |  64.9% |       LOSS |        SAVED
+  KXBTCD-26APR1423-T74299.99               |  NO | $0.52 | $0.06 |  88.3% |       LOSS |        SAVED
+  KXBTCD-26APR1500-T74299.99               |  NO | $0.45 | $0.04 |  89.9% |       LOSS |        SAVED
+  KXBTCD-26APR1510-T74099.99               | YES | $0.64 | $0.31 |  51.2% |       LOSS |        SAVED
+  KXBTCD-26APR1511-T74299.99               |  NO | $0.55 | $0.26 |  54.1% |        WIN |   MISSED WIN
+  KXBTCD-26APR1511-T74199.99               |  NO | $0.34 | $0.20 |  42.0% |        WIN |   MISSED WIN
+  KXBTCD-26APR1511-T74099.99               |  NO | $0.56 | $0.04 |  93.8% |       LOSS |        SAVED
+  KXBTCD-26APR1512-T73899.99               |  NO | $0.70 | $0.42 |  39.3% |        WIN |   MISSED WIN
+  KXBTCD-26APR1514-T74099.99               |  NO | $0.66 | $0.16 |  75.8% |       LOSS |        SAVED
+  KXBTCD-26APR1518-T74599.99               |  NO | $0.33 | $0.10 |  71.6% |       LOSS |        SAVED
+  KXBTCD-26APR1518-T74799.99               | YES | $0.30 | $0.06 |  82.0% |       LOSS |        SAVED
+  KXBTCD-26APR1519-T74899.99               |  NO | $0.32 | $0.24 |  23.4% |       LOSS |        SAVED
+  KXBTCD-26APR1519-T75099.99               |  NO | $0.68 | $0.54 |  21.3% |        WIN |   MISSED WIN
+  KXBTCD-26APR1519-T74999.99               |  NO | $0.46 | $0.23 |  49.5% |       LOSS |        SAVED
+  KXBTC15M-26APR151900-00                  | YES | $0.48 | $0.01 |  98.8% |       LOSS |        SAVED
+  KXBTCD-26APR1521-T74799.99               | YES | $0.60 | $0.22 |  64.5% |        WIN |   MISSED WIN
+  KXBTCD-26APR1523-T74799.99               |  NO | $0.69 | $0.41 |  39.4% |       LOSS |        SAVED
+  KXBTCD-26APR1523-T74699.99               |  NO | $0.49 | $0.20 |  59.6% |       LOSS |        SAVED
+  KXBTCD-26APR1601-T74899.99               |  NO | $0.34 | $0.12 |  65.2% |       LOSS |        SAVED
+  KXBTCD-26APR1601-T74999.99               |  NO | $0.68 | $0.34 |  50.4% |        WIN |   MISSED WIN
+  KXBTCD-26APR1601-T75099.99               | YES | $0.32 | $0.05 |  84.1% |       LOSS |        SAVED
+  KXBTC15M-26APR160730-30                  |  NO | $0.56 | $0.21 |  63.7% |       LOSS |        SAVED
+  KXBTCD-26APR1617-T74499.99               |  NO | $0.50 | $0.33 |  35.0% |       LOSS |        SAVED
+  KXBTCD-26APR1619-T74999.99               |  NO | $0.66 | $0.52 |  21.4% |        WIN |   MISSED WIN
+  KXBTCD-26APR1620-T74999.99               |  NO | $0.43 | $0.12 |  72.4% |       LOSS |        SAVED
+  KXBTCD-26APR1704-T74999.99               |  NO | $0.58 | $0.30 |  49.6% |       LOSS |        SAVED
+  KXBTCD-26APR1706-T75799.99               |  NO | $0.46 | $0.34 |  24.2% |       LOSS |        SAVED
+  KXBTC15M-26APR170615-15                  | YES | $0.49 | $0.00 |  99.7% |       LOSS |        SAVED
+  KXBTCD-26APR1720-T77199.99               | YES | $0.61 | $0.21 |  66.7% |       LOSS |        SAVED
+  KXBTCD-26APR1804-T77099.99               | YES | $0.54 | $0.07 |  87.9% |       LOSS |        SAVED
+  KXBTCD-26APR1808-T75899.99               |  NO | $0.64 | $0.07 |  89.0% |       LOSS |        SAVED
+

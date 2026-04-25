@@ -575,32 +575,59 @@ def attempt_entry(ticker, direction, candidate, score, details):
 	volume = candidate.get("volume", 0)
 	title = market.get('title') or market.get('event_ticker') or 'Unknown'
 
+	# ───────── Tiering: classify signal and size accordingly ─────────
+	# Empirically validated on 821 settled S6ER trades (Apr 10-25 2026):
+	#   PREMIUM  (RISK_FLAT * MULT):  (score>=80 AND entry<=0.55 AND vol>=50k) OR vol>=100k   -> 91% WR
+	#   STANDARD (RISK_FLAT):         everything else passing baseline
+	#   SKIP dead zone:               score>=75 AND 0.66<=entry<=0.70 AND vol<50k             -> -5.9% ROI
+	# Refined 3-tier vs flat $20: +$2,720 net (+48.3% improvement) at PREMIUM_MULT=2.0.
+	side = "yes" if direction == "YES" else "no"
+	tier_entry = candidate.get("yes_price") if side == "yes" else candidate.get("no_price")
+	if tier_entry is None:
+		# Fall back to live ask if signal price missing
+		tier_entry = yes_ask if side == "yes" else no_ask
+
+	tier = "STANDARD"
+	if discord_bot.is_feature_enabled("tiering", EDGE_SCANNER_TIERING_ENABLED):
+		# Skip dead zone first
+		if score >= 75 and 0.66 <= tier_entry <= 0.70 and volume < 50000:
+			logger.info(
+				f"[EDGE] SKIP dead zone for {ticker} | score={score:.0f} entry=${tier_entry:.3f} vol={volume} "
+				f"(score>=75 + entry 0.66-0.70 + vol<50k = -5.9% ROI band)"
+			)
+			return False
+		# Premium tier
+		is_tight = (score >= 80 and tier_entry <= 0.55 and volume >= 50000)
+		is_high_vol = (volume >= 100000)
+		if is_tight or is_high_vol:
+			tier = "PREMIUM"
+
+	risk_dollars = (EDGE_SCANNER_RISK_FLAT * EDGE_SCANNER_RISK_PREMIUM_MULT) if tier == "PREMIUM" else EDGE_SCANNER_RISK_FLAT
+
 	logger.info(
 		f"[EDGE] Attempting entry for {ticker} | dir={direction} | score={score:.0f} | "
-		f"yes_bid=${yes_best_bid:.3f} no_bid=${no_best_bid:.3f} | {title[:80]}"
+		f"tier={tier} risk=${risk_dollars:.2f} | yes_bid=${yes_best_bid:.3f} no_bid=${no_best_bid:.3f} | {title[:80]}"
 	)
 
-	# Balance check — skip if cash < flat risk amount
+	# Balance check — skip if cash < tier risk amount
 	try:
 		bal_data = signed_request("GET", "/portfolio/balance")
 		cash = bal_data.get('balance', 0) / 100
-		if cash < EDGE_SCANNER_RISK_FLAT:
+		if cash < risk_dollars:
 			logger.warning(
-				f"[EDGE] Cash ${cash:.2f} below ${EDGE_SCANNER_RISK_FLAT:.2f} — pausing trades, skipping {ticker}"
+				f"[EDGE] Cash ${cash:.2f} below ${risk_dollars:.2f} ({tier}) — pausing trades, skipping {ticker}"
 			)
 			return False
 	except Exception as e:
 		logger.error(f"[EDGE] Balance check failed: {e}")
 		return False
 
-	# Build order — flat $ risk per trade from EDGE_SCANNER_RISK_FLAT
-	side = "yes" if direction == "YES" else "no"
+	# Build order — tier-based $ risk per trade
 	contract_price = yes_ask if side == "yes" else no_ask
 	SLIPPAGE_CENTS = 1
 	limit_price_cents = min(99, int(contract_price * 100) + SLIPPAGE_CENTS)
 	limit_price_dollars = limit_price_cents / 100.0
 
-	risk_dollars = EDGE_SCANNER_RISK_FLAT
 	count = int(risk_dollars / limit_price_dollars) if limit_price_dollars > 0 else 0
 
 	if count <= 0:
@@ -1350,6 +1377,10 @@ def evaluate_candidates():
 			if is_filtered:
 				continue
 
+			# --- Optional: pause buying via Discord (!scanner-buy off) — signals still get logged above ---
+			if discord_bot.is_paused("scanner_buy"):
+				continue
+
 			success = attempt_entry(ticker, direction, candidate, score, details)
 			if success:
 				with _STATE_LOCK:
@@ -1452,8 +1483,8 @@ if __name__ == "__main__":
 		)
 		exit(1)
 
-	# Start Discord command listener
-	discord_bot.start_command_listener(respond=False)
+	# Start Discord command listener (this scanner is the primary responder for !commands)
+	discord_bot.start_command_listener(respond=True)
 
 	# Initial market scan and WS setup
 	logger.info("[EDGE] Performing initial market scan...")

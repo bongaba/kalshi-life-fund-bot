@@ -1030,8 +1030,8 @@ logger.info(f"[BOT START] LOOP_SCHEDULE: {BOT_LOOP_SCHEDULE}")
 logger.info(f"[BOT START] RUN_MODE: {BOT_RUN_MODE}")
 logger.info(f"[BOT START] DECISION_MODE: {get_decision_mode_label()}")
 
-# Start Discord command listener for remote control
-discord_bot.start_command_listener()
+# Start Discord command listener for remote control (silent — orderbook_edge_scanner owns the replies)
+discord_bot.start_command_listener(respond=False)
 
 if BOT_RUN_MODE == "single_run":
     logger.info("[BOT START] Single-run mode active | executing one cycle and exiting")
